@@ -12,6 +12,8 @@ Item {
   property string lastError: ""
   property bool setupBusy: false
   property bool startBusy: false
+  property string lastRaw: ""
+  property int _loadFails: 0
 
   readonly property string pluginDir: {
     var url = Qt.resolvedUrl(".")
@@ -33,7 +35,12 @@ Item {
   }
 
   function applyRaw(raw) {
-    var parsed = Model.parseStatus(raw)
+    var text = String(raw || "").trim()
+    if (text === lastRaw) return
+    var parsed = Model.parseStatus(text)
+    // A truncated read of a status rewrite must not blank the QR.
+    if (lastRaw !== "" && !parsed.ok && !parsed.running) return
+    lastRaw = text
     daemonReachable = parsed.ok && parsed.running
     status = parsed
     if (parsed.error) lastError = parsed.error
@@ -41,6 +48,8 @@ Item {
   }
 
   function stateGone() {
+    lastRaw = ""
+    _loadFails = 0
     daemonReachable = false
     status = Model.emptyStatus()
   }
@@ -99,8 +108,11 @@ Item {
     watchChanges: true
     printErrors: false
     onFileChanged: reload()
-    onLoaded: root.applyRaw(text())
-    onLoadFailed: root.stateGone()
+    onLoaded: { root._loadFails = 0; root.applyRaw(text()) }
+    onLoadFailed: {
+      root._loadFails += 1
+      if (root._loadFails >= 2) root.stateGone()
+    }
   }
 
   Process {

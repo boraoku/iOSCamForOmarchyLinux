@@ -98,6 +98,7 @@ class App:
         self.token = self._load_or_make_token()
         self.preview_path = runtime_dir() / "preview-0.jpg"
         self.qr_path = runtime_dir() / "qr.png"
+        self.qr_url = ""
         self.status_path = runtime_dir() / "status.json"
         self.ctl_path = runtime_dir() / "ctl.sock"
         self.pid_path = runtime_dir() / "server.pid"
@@ -263,6 +264,8 @@ def public_pair_url() -> str:
 
 
 def write_qr(url: str) -> None:
+    if url == APP.qr_url and APP.qr_path.exists():
+        return
     qrencode = shutil.which("qrencode")
     if not qrencode:
         return
@@ -275,6 +278,7 @@ def write_qr(url: str) -> None:
             stderr=subprocess.DEVNULL,
         )
         tmp.replace(APP.qr_path)
+        APP.qr_url = url
     except (subprocess.CalledProcessError, OSError):
         if tmp.exists():
             tmp.unlink(missing_ok=True)

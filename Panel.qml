@@ -27,7 +27,7 @@ Panel {
 
   property int cursorIndex: 0
   property bool cursorActive: false
-  property int qrRev: 0
+  property string qrSource: ""
   property int phraseIndex: 0
   property string lastPairUrl: ""
   property int previewShow: 0
@@ -102,7 +102,6 @@ Panel {
     cursorActive = false
     cursorIndex = 0
     cam.refresh()
-    qrRev++
     Qt.callLater(function () { keyCatcher.forceActiveFocus() })
   }
 
@@ -133,10 +132,12 @@ Panel {
   Connections {
     target: cam
     function onStatusChanged() {
-      if (cam.status.pairUrl !== root.lastPairUrl) {
-        root.lastPairUrl = cam.status.pairUrl
-        root.qrRev++
-      }
+      var url = cam.status.pairUrl
+      var png = cam.status.qrPng
+      if (!url || !png) return
+      if (url === root.lastPairUrl && root.qrSource !== "") return
+      root.lastPairUrl = url
+      root.qrSource = "file://" + png + "?v=" + Date.now()
     }
   }
 
@@ -272,7 +273,7 @@ Panel {
           }
 
           Item {
-            visible: !cam.streaming && cam.status.qrPng !== ""
+            visible: !cam.streaming && root.qrSource !== ""
             width: parent.width
             height: qrBox.height
 
@@ -287,10 +288,10 @@ Panel {
               Image {
                 anchors.fill: parent
                 anchors.margins: Style.space(10)
-                source: Model.fileUrl(cam.status.qrPng, root.qrRev)
-                cache: false
+                source: root.qrSource
+                cache: true
+                asynchronous: false
                 fillMode: Image.PreserveAspectFit
-                asynchronous: true
               }
             }
           }
