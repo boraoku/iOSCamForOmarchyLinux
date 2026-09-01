@@ -1,0 +1,52 @@
+#!/bin/bash
+# User-facing install for the iPhone Camera plugin.
+#   ./setup              packages, user service, virtual camera (password once)
+#   ./setup --uninstall  stop the daemon and offer to remove the device
+set -euo pipefail
+
+HERE=$(cd "$(dirname "$0")" && pwd)
+ID=io.github.boraoku.ioscam
+SERVER="$HERE/daemon/iphone-camera-server.py"
+SETUP_DEVICE="$HERE/setup-device"
+ROOT_SETUP=/usr/local/lib/omarchy-iphone-camera/setup-device
+
+privileged() {
+  local helper="$SETUP_DEVICE"
+  [[ -x $ROOT_SETUP ]] && helper="$ROOT_SETUP"
+  if sudo -n true 2>/dev/null; then sudo "$helper" "$@"; else pkexec "$helper" "$@"; fi
+}
+
+if [[ ${1:-} == --uninstall ]]; then
+  systemctl --user disable --now omarchy-iphone-camera.service >/dev/null 2>&1 || true
+  rm -f "$HOME/.config/systemd/user/omarchy-iphone-camera.service"
+  systemctl --user daemon-reload >/dev/null 2>&1 || true
+  if ! privileged uninstall; then
+    echo "note: virtual camera was not removed (cancelled or failed)." >&2
+    echo "  retry: sudo $SETUP_DEVICE uninstall" >&2
+  fi
+  echo "daemon stopped. Remove the plugin with: omarchy plugin remove $ID"
+  exit 0
+fi
+
+chmod +x "$SERVER" "$SETUP_DEVICE"
+
+missing=()
+for p in ffmpeg openssl qrencode v4l-utils; do
+  pacman -Q "$p" >/dev/null 2>&1 || missing+=("$p")
+done
+if ((${#missing[@]})); then
+  echo "› installing ${missing[*]}"
+  omarchy pkg add "${missing[@]}"
+fi
+
+echo "› installing user service"
+python3 "$SERVER" install-unit >/dev/null
+systemctl --user enable --now omarchy-iphone-camera.service
+
+echo "› creating the iPhone Camera virtual webcam (password prompt)"
+privileged install
+
+echo
+echo "done. Click the camera icon in the bar, scan the QR code with your iPhone,"
+echo "install the trust profile once, then tap Open camera."
+echo "In Zoom / Meet / OBS pick the camera named: iPhone Camera"

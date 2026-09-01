@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>iPhone Camera</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #000; color: #f4f4f4;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif; }
+  body { display: flex; flex-direction: column; min-height: 100dvh; }
+  #stage { position: relative; flex: 1; background: #000; overflow: hidden; }
+  video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+  canvas { display: none; }
+  #hud {
+    position: absolute; left: 0; right: 0; bottom: 0;
+    padding: 16px 16px calc(18px + env(safe-area-inset-bottom));
+    background: linear-gradient(transparent, rgba(0,0,0,.72));
+    display: flex; flex-direction: column; gap: 10px;
+  }
+  #status { font-size: 13px; letter-spacing: .08em; text-transform: uppercase; color: #c8c8c8; }
+  .row { display: flex; gap: 10px; }
+  button {
+    flex: 1; border: 0; border-radius: 14px; padding: 14px 12px;
+    font-size: 16px; font-weight: 650; background: #f4f4f4; color: #111;
+  }
+  button.ghost { background: rgba(255,255,255,.14); color: #f4f4f4; }
+  button:disabled { opacity: .45; }
+  #err { color: #ff8b8b; font-size: 14px; min-height: 1.2em; }
+</style>
+</head>
+<body>
+  <div id="stage">
+    <video id="video" playsinline muted autoplay></video>
+    <canvas id="canvas"></canvas>
+    <div id="hud">
+      <div id="status">Back camera · idle</div>
+      <div id="err"></div>
+      <div class="row">
+        <button id="start" type="button">Start back camera</button>
+      </div>
+      <div class="row">
+        <button id="flip" class="ghost" type="button">Front</button>
+        <button id="torch" class="ghost" type="button">Light</button>
+      </div>
+    </div>
+  </div>
+<script>
+(() => {
+  const TOKEN = "__TOKEN__";
+  const OUT_W = 1280;
+  const OUT_H = 720;
+  const FPS = 24;
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const wsUrl = `${proto}://${location.host}/ws?k=${encodeURIComponent(TOKEN)}`;
+
+  const video = document.getElementById("video");
+  const canvas = document.getElementById("canvas");
+  const ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
+  const statusEl = document.getElementById("status");
+  const errEl = document.getElementById("err");
+  const startBtn = document.getElementById("start");
+  const flipBtn = document.getElementById("flip");
+  const torchBtn = document.getElementById("torch");
+
+  let facing = "environment";
+  let stream = null;
+  let track = null;
+  let ws = null;
+  let running = false;
+  let torchOn = false;
+  let wakeLock = null;
+  let timer = 0;
+  let encoding = false;
+
+  canvas.width = OUT_W;
+  canvas.height = OUT_H;
+
+  const setStatus = (t) => { statusEl.textContent = t; };
+  const setErr = (t) => { errEl.textContent = t || ""; };
+  const cameraName = () => (facing === "environment" ? "Back" : "Front");
+
+  async function holdAwake() {
+    try { wakeLock = await navigator.wakeLock.request("screen"); } catch (_) {}
+  }
+
+  function stopSend() {
+    running = false;
+    if (timer) { clearTimeout(timer); timer = 0; }
+    encoding = false;
+  }
+
+  function closeWs() {
+    if (ws) {
+      try { ws.close(); } catch (_) {}
+      ws = null;
+    }
+  }
+
+  function connect() {
+    closeWs();
+    const socket = new WebSocket(wsUrl);
+    socket.binaryType = "arraybuffer";
+    ws = socket;
+    socket.onopen = () => {
+      setErr("");
+      setStatus(cameraName() + " camera · live");
+      sendHello();
+    };
+    socket.onclose = () => {
+      if (ws === socket) ws = null;
+      if (running) setTimeout(connect, 800);
+    };
+    socket.onerror = () => setErr("Could not reach the computer. Stay on the same Wi-Fi, or use USB hotspot.");
+  }
+
+  function sendHello() {
+    if (!ws || ws.readyState !== 1) return;
+    ws.send(JSON.stringify({
+      type: "hello",
+      camera: facing === "environment" ? "back" : "front",
+      width: OUT_W,
+      height: OUT_H
+    }));
+  }
+
+  function drawCover() {
+    const vw = video.videoWidth;
+    const vh = video.videoHeight;
+    if (!vw || !vh) return false;
+    const scale = Math.max(OUT_W / vw, OUT_H / vh);
+    const dw = vw * scale;
+    const dh = vh * scale;
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, OUT_W, OUT_H);
+    ctx.drawImage(video, (OUT_W - dw) / 2, (OUT_H - dh) / 2, dw, dh);
+    return true;
+  }
+
+  function pump() {
+    if (!running) return;
+    timer = setTimeout(pump, 1000 / FPS);
+    if (encoding) return;
+    if (video.readyState < 2) return;
+    if (!drawCover()) return;
+    if (!ws || ws.readyState !== 1) return;
+    encoding = true;
+    canvas.toBlob((blob) => {
+      if (!blob || !running) { encoding = false; return; }
+      blob.arrayBuffer().then((buf) => {
+        if (running && ws && ws.readyState === 1) ws.send(buf);
+      }).finally(() => { encoding = false; });
+    }, "image/jpeg", 0.68);
+  }
+
+  function isBackTrack(t) {
+    if (!t) return false;
+    const mode = (t.getSettings() || {}).facingMode || "";
+    if (mode) return mode === "environment";
+    return /back|rear|environment/i.test(t.label || "");
+  }
+
+  async function openWith(constraints) {
+    const s = await navigator.mediaDevices.getUserMedia({ audio: false, video: constraints });
+    return s;
+  }
+
+  async function openCamera() {
+    setErr("");
+    if (stream) {
+      stream.getTracks().forEach((t) => t.stop());
+      stream = null;
+    }
+    const sized = { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 24 } };
+    const tries = facing === "environment"
+      ? [
+          { facingMode: { exact: "environment" }, ...sized },
+          { facingMode: { ideal: "environment" }, ...sized },
+          { facingMode: "environment" }
+        ]
+      : [
+          { facingMode: { exact: "user" }, ...sized },
+          { facingMode: { ideal: "user" }, ...sized },
+          { facingMode: "user" }
+        ];
+    let lastErr = null;
+    for (const videoConstraints of tries) {
+      try {
+        stream = await openWith(videoConstraints);
+        lastErr = null;
+        break;
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    if (!stream) {
+      setErr(lastErr && lastErr.message ? lastErr.message : "Camera permission denied");
+      return false;
+    }
+    track = stream.getVideoTracks()[0] || null;
+    if (facing === "environment" && track && !isBackTrack(track)) {
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const back = devices.find((d) => d.kind === "videoinput" && /back|rear|environment/i.test(d.label || ""));
+        if (back && back.deviceId) {
+          stream.getTracks().forEach((t) => t.stop());
+          stream = await openWith({ deviceId: { exact: back.deviceId }, ...sized });
+          track = stream.getVideoTracks()[0] || null;
+        }
+      } catch (_) {}
+    }
+    const settings = track ? track.getSettings() : {};
+    if (settings.facingMode === "user" || settings.facingMode === "environment") {
+      facing = settings.facingMode;
+    }
+    video.srcObject = stream;
+    await video.play().catch(() => {});
+    flipBtn.textContent = facing === "environment" ? "Front" : "Back";
+    return true;
+  }
+
+  async function start() {
+    const ok = await openCamera();
+    if (!ok) return;
+    await holdAwake();
+    connect();
+    running = true;
+    startBtn.textContent = "Stop";
+    pump();
+  }
+
+  function stop() {
+    stopSend();
+    closeWs();
+    if (stream) stream.getTracks().forEach((t) => t.stop());
+    stream = null;
+    track = null;
+    video.srcObject = null;
+    startBtn.textContent = "Start back camera";
+    setStatus("Idle");
+    if (wakeLock) { try { wakeLock.release(); } catch (_) {} wakeLock = null; }
+  }
+
+  startBtn.addEventListener("click", () => {
+    if (running) stop(); else start();
+  });
+
+  flipBtn.addEventListener("click", async () => {
+    facing = facing === "environment" ? "user" : "environment";
+    if (running) {
+      await openCamera();
+      sendHello();
+    } else {
+      flipBtn.textContent = facing === "environment" ? "Front" : "Back";
+    }
+  });
+
+  torchBtn.addEventListener("click", async () => {
+    if (!track || !track.getCapabilities) return;
+    const caps = track.getCapabilities();
+    if (!caps.torch) { setErr("Torch is not available on this camera"); return; }
+    torchOn = !torchOn;
+    try { await track.applyConstraints({ advanced: [{ torch: torchOn }] }); }
+    catch (_) { setErr("Could not toggle the light"); }
+  });
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") holdAwake();
+  });
+})();
+</script>
+</body>
+</html>

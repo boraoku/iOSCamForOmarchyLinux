@@ -1,0 +1,141 @@
+#!/bin/bash
+# Privileged helper: create the "iPhone Camera" v4l2loopback device now and at boot.
+# Invoked with pkexec/sudo from the panel or ./setup.
+#
+#   install     create the module config, boot unit, and device
+#   uninstall   remove them
+#   status      print JSON
+set -euo pipefail
+export LC_ALL=C
+
+LABEL="iPhone Camera"
+NR=42
+UNIT=/etc/systemd/system/omarchy-iphone-camera-device.service
+MODLOAD=/etc/modules-load.d/omarchy-iphone-camera.conf
+MODPROBE=/etc/modprobe.d/omarchy-iphone-camera.conf
+LIBDIR=/usr/local/lib/omarchy-iphone-camera
+
+need_root() { [[ $EUID -eq 0 ]] || { echo "must run as root (pkexec/sudo)" >&2; exit 1; }; }
+
+device_path() {
+  v4l2-ctl --list-devices 2>/dev/null | awk -v l="$LABEL" '
+    $0 ~ l ":" {grab=1; next}
+    grab && /\/dev\/video[0-9]+/ { print $1; exit }
+    $0 ~ /:$/ { grab=0 }
+  '
+}
+
+ensure_packages() {
+  local pkgs=() krel flavour=linux
+  krel=$(uname -r)
+  command -v v4l2loopback-ctl >/dev/null || pkgs+=(v4l2loopback-utils)
+  pacman -Q v4l2loopback-dkms >/dev/null 2>&1 || pkgs+=(v4l2loopback-dkms)
+  pacman -Q dkms >/dev/null 2>&1 || pkgs+=(dkms)
+  if [[ ! -e /usr/lib/modules/$krel/build ]]; then
+    case "$krel" in *-zen*) flavour=linux-zen;; *-lts*) flavour=linux-lts;; *-hardened*) flavour=linux-hardened;; *-rt-lts*) flavour=linux-rt-lts;; *-rt*) flavour=linux-rt;; esac
+    pacman -Q "$flavour" >/dev/null 2>&1 && pkgs+=("${flavour}-headers")
+  fi
+  ((${#pkgs[@]})) || return 0
+  echo "Installing ${pkgs[*]}…"
+  pacman -S --noconfirm --needed "${pkgs[@]}"
+}
+
+ensure_module() {
+  local krel; krel=$(uname -r)
+  if ! modprobe v4l2loopback 2>/dev/null; then
+    if [[ -e /usr/lib/modules/$krel/build ]] && command -v dkms >/dev/null; then
+      echo "Building v4l2loopback for $krel…"
+      dkms autoinstall -k "$krel" >/dev/null 2>&1 || dkms autoinstall >/dev/null 2>&1 || true
+      modprobe v4l2loopback 2>/dev/null || true
+    fi
+  fi
+}
+
+add_device() {
+  if command -v v4l2loopback-ctl >/dev/null; then
+    if v4l2loopback-ctl list 2>/dev/null | grep -q "$LABEL"; then
+      return 0
+    fi
+    v4l2loopback-ctl add -n "$LABEL" -x 1 -o 16 /dev/video$NR 2>/dev/null && return 0
+    v4l2loopback-ctl add -n "$LABEL" -x 1 /dev/video$NR && return 0
+  fi
+  # Module already loaded without our label: reload is last resort and would
+  # disrupt other loopback users (OBS, Camera Effects). Prefer ctl.
+  if [[ -z $(device_path) ]]; then
+    if lsmod | grep -q '^v4l2loopback'; then
+      echo "v4l2loopback is loaded but v4l2loopback-ctl could not add '$LABEL'. Install v4l2loopback-utils and retry." >&2
+      return 1
+    fi
+    modprobe v4l2loopback exclusive_caps=1 card_label="$LABEL" video_nr=$NR devices=1
+  fi
+}
+
+cmd_install() {
+  need_root
+  ensure_packages
+  if ! grep -qs '^[[:space:]]*options[[:space:]]\+v4l2loopback\b' /etc/modprobe.d/*.conf /usr/lib/modprobe.d/*.conf 2>/dev/null; then
+    echo "options v4l2loopback devices=0" > "$MODPROBE"
+  fi
+  echo v4l2loopback > "$MODLOAD"
+  ensure_module
+  cat > "$UNIT" <<EOF
+[Unit]
+Description=iPhone Camera virtual video device
+After=systemd-modules-load.service
+ConditionPathExists=/dev/v4l2loopback
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'v4l2-ctl --list-devices 2>/dev/null | grep -q "$LABEL" || v4l2loopback-ctl add -n "$LABEL" -x 1 -o 16 /dev/video$NR'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable omarchy-iphone-camera-device.service >/dev/null 2>&1 || true
+  add_device || true
+  systemctl restart omarchy-iphone-camera-device.service >/dev/null 2>&1 || true
+
+  install -d -m 755 "$LIBDIR"
+  local self; self=$(readlink -f "$0")
+  if [[ $self != "$LIBDIR/setup-device" && -n ${PKEXEC_UID:-${SUDO_UID:-}} ]]; then
+    install -m 755 -o root -g root "$self" "$LIBDIR/setup-device"
+  elif [[ $self != "$LIBDIR/setup-device" ]]; then
+    install -m 755 -o root -g root "$self" "$LIBDIR/setup-device"
+  fi
+
+  sleep 0.3
+  local dev; dev=$(device_path)
+  if [[ -z $dev ]]; then
+    echo "the virtual camera was not created. If the kernel was just updated, reboot, then run this again. Details: dkms status" >&2
+    exit 1
+  fi
+  echo "virtual camera: $dev"
+}
+
+cmd_uninstall() {
+  need_root
+  systemctl disable --now omarchy-iphone-camera-device.service >/dev/null 2>&1 || true
+  rm -f "$UNIT" "$MODLOAD" "$MODPROBE"
+  systemctl daemon-reload
+  local dev; dev=$(device_path)
+  if [[ -n $dev ]] && command -v v4l2loopback-ctl >/dev/null; then
+    v4l2loopback-ctl delete "$dev" || true
+  fi
+  rm -rf "$LIBDIR"
+  echo "removed virtual camera boot unit"
+}
+
+cmd_status() {
+  local dev; dev=$(device_path || true)
+  local unit=false; [[ -f $UNIT ]] && unit=true
+  printf '{"device":"%s","bootUnit":%s}\n' "$dev" "$unit"
+}
+
+case "${1:-}" in
+  install) cmd_install ;;
+  uninstall) cmd_uninstall ;;
+  status) cmd_status ;;
+  *) echo "usage: setup-device {install|uninstall|status}" >&2; exit 2 ;;
+esac

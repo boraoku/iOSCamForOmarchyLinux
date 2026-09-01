@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.boraoku.ioscam",
+  "name": "iOSCam",
+  "version": "1.0.0",
+  "author": "Bora Okumusoglu",
+  "license": "MIT",
+  "description": "Use your iPhone's back camera as a Continuity Camera-style webcam on Omarchy Linux.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "iPhone Camera",
+    "description": "Pair an iPhone as a virtual webcam from the bar.",
+    "category": "Video",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
