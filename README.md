@@ -1,6 +1,8 @@
 # iOSCam for Omarchy
 
-Use the **back camera of an iPhone** as a webcam on [Omarchy](https://omarchy.org/) Linux — the same idea as Continuity Camera on a Mac.
+![Screenshot of Plugin In Action](screenshot-2026-09-01_23-40-34.png)
+
+Use the **back or front camera of an iPhone** as a webcam on [Omarchy](https://omarchy.org/) Linux; the same idea as Continuity Camera on a Mac.
 
 The phone is the lens. Linux apps see a normal camera named **iPhone Camera**. No App Store app: scan a QR code, trust a profile once, and Safari streams the back camera.
 
@@ -72,7 +74,7 @@ Wired mode: plug the iPhone in, enable **Personal Hotspot → USB**, then scan a
 
 - Capture while the iPhone is locked (Safari cannot keep the camera in the background)
 - Center Stage, Studio Light, or Desk View (those are Apple-only)
-- A native iOS app — on purpose, so nothing has to come from the App Store
+- A native iOS app; on purpose, so nothing has to come from the App Store
 
 ## Remove
 
