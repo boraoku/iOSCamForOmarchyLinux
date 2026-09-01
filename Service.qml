@@ -14,6 +14,8 @@ Item {
   property bool startBusy: false
   property string lastRaw: ""
   property int _loadFails: 0
+  property string setupError: ""
+  property string setupLog: ""
 
   readonly property string pluginDir: {
     var url = Qt.resolvedUrl(".")
@@ -21,7 +23,6 @@ Item {
   }
   readonly property string serverPath: pluginDir + "/daemon/iphone-camera-server.py"
   readonly property string setupDevicePath: pluginDir + "/setup-device"
-  readonly property string rootSetupPath: "/usr/local/lib/omarchy-iphone-camera/setup-device"
   readonly property string statusPath: (Quickshell.env("XDG_RUNTIME_DIR") || ("/run/user/" + Quickshell.env("UID"))) + "/omarchy-iphone-camera/status.json"
   readonly property bool running: daemonReachable && status.running
   readonly property bool streaming: running && status.streaming
@@ -44,7 +45,7 @@ Item {
     daemonReachable = parsed.ok && parsed.running
     status = parsed
     if (parsed.error) lastError = parsed.error
-    else if (daemonReachable) lastError = ""
+    else if (daemonReachable && setupError === "") lastError = ""
   }
 
   function stateGone() {
@@ -83,12 +84,12 @@ Item {
 
   function setupDevice() {
     setupBusy = true
+    setupError = ""
+    setupLog = ""
     lastError = ""
-    var helper = rootSetupPath
-    setupProc.command = ["bash", "-lc",
-      "helper=" + quote(setupDevicePath) + "; " +
-      "[ -x /usr/local/lib/omarchy-iphone-camera/setup-device ] && helper=/usr/local/lib/omarchy-iphone-camera/setup-device; " +
-      "if sudo -n true 2>/dev/null; then sudo \"$helper\" install; else pkexec \"$helper\" install; fi"]
+    // Always run the plugin copy so updates are not shadowed by a stale
+    // root-owned helper left from an earlier install.
+    setupProc.command = ["pkexec", setupDevicePath, "install"]
     setupProc.running = true
   }
 
@@ -148,14 +149,24 @@ Item {
 
   Process {
     id: setupProc
-    stdout: StdioCollector { waitForEnd: true }
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.setupLog = String(text || "").trim()
+    }
     stderr: StdioCollector {
       waitForEnd: true
-      onStreamFinished: if (text) root.lastError = String(text).trim()
+      onStreamFinished: if (text) root.setupError = String(text).trim()
     }
     onExited: function (code) {
       root.setupBusy = false
-      if (code !== 0 && !root.lastError) root.lastError = "Virtual camera setup failed or was cancelled"
+      if (code !== 0) {
+        var err = root.setupError || root.setupLog
+        root.setupError = err !== "" ? err : "Virtual camera setup failed or was cancelled"
+        root.lastError = root.setupError
+      } else {
+        root.setupError = ""
+        root.lastError = ""
+      }
       Qt.callLater(root.refresh)
     }
   }
