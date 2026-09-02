@@ -67,6 +67,7 @@ omarchy bar move io.github.boraoku.ioscam --section right
 - **New code** in the panel forgets every paired phone and issues a fresh QR.
 - Status and control never leave the machine: the panel reads a status file and a Unix socket in `$XDG_RUNTIME_DIR`, both `0700`. Nothing on the network reports the daemon's state.
 - The plaintext HTTP port serves only the static landing page and the public CA certificate; it accepts no credentials and no WebSocket.
+- State lives in three directories the daemon owns and opens once by descriptor: `$XDG_RUNTIME_DIR/omarchy-iphone-camera` (status, QR, preview, control socket), `~/.local/state/omarchy-iphone-camera` (paired sessions), and `~/.local/share/omarchy-iphone-camera/ca` (the generated CA and server certificate). They are forced to `0700`, symlinks are never followed, every file must be a regular file owned by the user within a size cap (secrets `0600`), and replacements are written to a temp file, fsync'd, and renamed inside the directory.
 - Input from the phone is bounded before it is read: a WebSocket message is capped at 2 MiB (4 KiB for text), frames must be well-formed masked WebSocket frames, at most 16 connections are open at once, and every image must parse as a JPEG between 16 and 4096 pixels a side before it reaches ffmpeg.
 
 ### Why Tailscale only

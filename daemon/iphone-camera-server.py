@@ -26,6 +26,7 @@ import shutil
 import signal
 import socket
 import ssl
+import stat
 import subprocess
 import sys
 import threading
@@ -76,37 +77,209 @@ JPEG_MIN_DIM = 16
 JPEG_MAX_DIM = 4096
 SOF_MARKERS = frozenset({0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF})
 
+# File size caps (bytes). Every file we read is bounded before it is read.
+MAX_SESSIONS_FILE = 64 * 1024
+MAX_STATUS_FILE = 64 * 1024
+MAX_PEM_FILE = 64 * 1024
+MAX_SAN_FILE = 4 * 1024
+MAX_PID_FILE = 32
+MAX_HTML_FILE = 1024 * 1024
+MAX_QR_FILE = 1024 * 1024
+
 PLUGIN_ID = "io.github.boraoku.ioscam"
-
-
-def runtime_dir() -> Path:
-    base = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
-    path = Path(base) / "omarchy-iphone-camera"
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    return path
-
-
-def state_dir() -> Path:
-    base = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local/state")
-    path = Path(base) / "omarchy-iphone-camera"
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    return path
-
-
-def data_dir() -> Path:
-    base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local/share")
-    path = Path(base) / "omarchy-iphone-camera"
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    return path
-
-
-def plugin_root() -> Path:
-    return Path(__file__).resolve().parent.parent
 
 
 def log(msg: str) -> None:
     sys.stderr.write(f"iphone-camera: {msg}\n")
     sys.stderr.flush()
+
+
+# ---------------------------------------------------------------------------
+# Trusted directories and descriptor-relative file IO
+# ---------------------------------------------------------------------------
+
+class FileSafetyError(OSError):
+    """A path did not meet the ownership / type / mode / size requirements."""
+
+
+class SafeDir:
+    """A directory we own, opened once by descriptor.
+
+    Every operation inside it is relative to that descriptor (dir_fd) and
+    never follows a symlink, so a planted link or a swapped path cannot
+    redirect a read or write. Files must be regular, owned by us, and within a
+    size cap; secrets must not be readable by anyone else. Replacements go to
+    an O_EXCL temp file, are fsync'd, and are renamed within the directory.
+    """
+
+    DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    # O_NONBLOCK: opening a FIFO planted under a file's name must not hang;
+    # it is a no-op for the regular files we then require.
+    OPEN_FLAGS = os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NOCTTY | os.O_NONBLOCK
+
+    def __init__(self, base_fd: int, name: str, path: Path, private: bool) -> None:
+        self.path = path
+        self.private = private
+        uid = os.getuid()
+        try:
+            os.mkdir(name, 0o700 if private else 0o755, dir_fd=base_fd)
+        except FileExistsError:
+            pass
+        except OSError as e:
+            raise FileSafetyError(f"cannot create {path}: {e}") from None
+        try:
+            # O_NOFOLLOW: a symlink where the directory should be is refused (ELOOP).
+            self.fd = os.open(name, self.DIR_FLAGS, dir_fd=base_fd)
+        except OSError as e:
+            raise FileSafetyError(f"cannot open directory {path}: {e}") from None
+        st = os.fstat(self.fd)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != uid:
+            os.close(self.fd)
+            raise FileSafetyError(f"{path} is not a directory owned by uid {uid}")
+        if private and st.st_mode & 0o077:
+            os.fchmod(self.fd, 0o700)
+        elif not private and st.st_mode & 0o022:
+            os.close(self.fd)
+            raise FileSafetyError(f"{path} is writable by other users ({stat.filemode(st.st_mode)})")
+        if private:
+            self._remove_stale_tmp()
+
+    @classmethod
+    def at(cls, base: Path, name: str, private: bool = True, create_base_mode: int | None = 0o700) -> "SafeDir":
+        """Open `base/name`, creating it if needed. `base` must be ours and not world-writable."""
+        if not base.is_dir():
+            if create_base_mode is None:
+                raise FileSafetyError(f"{base} does not exist")
+            try:
+                os.makedirs(base, create_base_mode, exist_ok=True)
+            except OSError as e:
+                raise FileSafetyError(f"cannot create {base}: {e}") from None
+        try:
+            base_fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        except OSError as e:
+            raise FileSafetyError(f"cannot open {base}: {e}") from None
+        try:
+            st = os.fstat(base_fd)
+            if st.st_uid != os.getuid():
+                raise FileSafetyError(f"{base} is not owned by uid {os.getuid()}")
+            if st.st_mode & 0o022:
+                raise FileSafetyError(f"{base} is writable by other users ({stat.filemode(st.st_mode)})")
+            return cls(base_fd, name, base / name, private)
+        finally:
+            os.close(base_fd)
+
+    def child(self, name: str, private: bool = True) -> "SafeDir":
+        return SafeDir(self.fd, name, self.path / name, private)
+
+    # -- reading -----------------------------------------------------------
+
+    def _check(self, fd: int, name: str, max_size: int, secret: bool) -> None:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise FileSafetyError(f"{self.path / name} is not a regular file")
+        if st.st_uid != os.getuid():
+            raise FileSafetyError(f"{self.path / name} is not owned by us")
+        if secret and st.st_mode & 0o077:
+            raise FileSafetyError(f"{self.path / name} is readable by others ({stat.filemode(st.st_mode)})")
+        if st.st_size > max_size:
+            raise FileSafetyError(f"{self.path / name} is larger than {max_size} bytes")
+
+    def read(self, name: str, max_size: int, secret: bool = False) -> bytes | None:
+        """Contents of a verified regular file, or None if it does not exist."""
+        try:
+            fd = os.open(name, os.O_RDONLY | self.OPEN_FLAGS, dir_fd=self.fd)
+        except FileNotFoundError:
+            return None
+        except OSError as e:
+            raise FileSafetyError(f"cannot open {self.path / name}: {e}") from None
+        try:
+            self._check(fd, name, max_size, secret)
+            chunks: list[bytes] = []
+            total = 0
+            while total <= max_size:
+                chunk = os.read(fd, max_size + 1 - total)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+            if total > max_size:
+                raise FileSafetyError(f"{self.path / name} grew past {max_size} bytes")
+            return b"".join(chunks)
+        finally:
+            os.close(fd)
+
+    def verify(self, name: str, max_size: int, secret: bool = False) -> bool:
+        """True if `name` exists and is a regular, owned file within the caps."""
+        try:
+            fd = os.open(name, os.O_RDONLY | self.OPEN_FLAGS, dir_fd=self.fd)
+        except OSError:
+            return False
+        try:
+            self._check(fd, name, max_size, secret)
+            return True
+        except FileSafetyError:
+            return False
+        finally:
+            os.close(fd)
+
+    def exists(self, name: str, kind=stat.S_ISREG) -> bool:
+        try:
+            st = os.stat(name, dir_fd=self.fd, follow_symlinks=False)
+        except OSError:
+            return False
+        return bool(kind(st.st_mode)) and st.st_uid == os.getuid()
+
+    # -- writing -----------------------------------------------------------
+
+    def write(self, name: str, data: bytes, mode: int = 0o600) -> None:
+        """Atomically replace `name`: O_EXCL temp file, fsync, rename, fsync dir."""
+        tmp = f".{name}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | self.OPEN_FLAGS, mode, dir_fd=self.fd)
+        try:
+            view = memoryview(data)
+            while view:
+                n = os.write(fd, view)
+                view = view[n:]
+            os.fsync(fd)
+        except BaseException:
+            os.close(fd)
+            self.unlink(tmp)
+            raise
+        os.close(fd)
+        self.rename(tmp, name)
+
+    def rename(self, src: str, dst: str) -> None:
+        os.rename(src, dst, src_dir_fd=self.fd, dst_dir_fd=self.fd)
+        os.fsync(self.fd)
+
+    def unlink(self, name: str) -> None:
+        try:
+            os.unlink(name, dir_fd=self.fd)   # never follows symlinks
+        except FileNotFoundError:
+            pass
+
+    def _remove_stale_tmp(self) -> None:
+        try:
+            for entry in os.listdir(self.fd):
+                if entry.startswith(".") and entry.endswith(".tmp"):
+                    self.unlink(entry)
+        except OSError:
+            pass
+
+
+def open_dirs() -> tuple[SafeDir, SafeDir, SafeDir, SafeDir]:
+    """(runtime, state, data, ca) trusted directories."""
+    run_base = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
+    run = SafeDir.at(run_base, "omarchy-iphone-camera", create_base_mode=None)
+    state_base = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state")
+    state = SafeDir.at(state_base, "omarchy-iphone-camera")
+    data_base = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
+    data = SafeDir.at(data_base, "omarchy-iphone-camera")
+    return run, state, data, data.child("ca")
+
+
+def plugin_root() -> Path:
+    return Path(__file__).resolve().parent.parent
 
 
 # ---------------------------------------------------------------------------
@@ -142,18 +315,14 @@ class App:
         self.sessions: dict[str, dict] = {}
         self.bind_ip = ""          # tailnet address the listeners are bound to, "" until bound
         self.tailscale_ip = ""
+        self.run, self.state, self.data, self.ca = open_dirs()
         # Earlier versions kept one reusable token here; it is obsolete.
-        (state_dir() / "token").unlink(missing_ok=True)
+        self.state.unlink("token")
         self._load_sessions()
         self._new_pair_code()
-        self.preview_path = runtime_dir() / "preview-0.jpg"
-        self.qr_path = runtime_dir() / "qr.png"
+        self.preview_name = "preview-0.jpg"
         self.qr_url = ""
-        self.status_path = runtime_dir() / "status.json"
-        self.ctl_path = runtime_dir() / "ctl.sock"
-        self.pid_path = runtime_dir() / "server.pid"
-        self.ca_dir = data_dir() / "ca"
-        self.ca_dir.mkdir(mode=0o700, exist_ok=True)
+        self.ctl_path = self.run.path / "ctl.sock"
 
     # -- one-time pairing code -------------------------------------------
 
@@ -212,14 +381,12 @@ class App:
         _close_stream("Pairing reset", notify="reset")
         publish()
 
-    def _sessions_path(self) -> Path:
-        return state_dir() / "sessions.json"
-
     def _load_sessions(self) -> None:
-        path = self._sessions_path()
         try:
-            data = json.loads(path.read_text()) if path.exists() else {}
-        except (OSError, json.JSONDecodeError):
+            raw = self.state.read("sessions.json", MAX_SESSIONS_FILE, secret=True)
+            data = json.loads(raw) if raw else {}
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
+            log(f"ignoring sessions.json: {e}")
             data = {}
         if not isinstance(data, dict):
             return
@@ -232,14 +399,14 @@ class App:
                 self.sessions[token] = {"created": created, "agent": str(meta.get("agent") or "")[:120]}
 
     def _save_sessions(self) -> None:
-        path = self._sessions_path()
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(self.sessions) + "\n")
-        tmp.chmod(0o600)
-        tmp.replace(path)
+        self.state.write("sessions.json", (json.dumps(self.sessions) + "\n").encode(), 0o600)
 
 
-APP = App()
+try:
+    APP = App()
+except FileSafetyError as e:
+    log(f"refusing to start: {e}")
+    sys.exit(1)
 
 
 def find_loopback() -> str:
@@ -372,28 +539,27 @@ def public_pair_url() -> str:
 
 
 def write_qr(url: str) -> None:
-    if url == APP.qr_url and APP.qr_path.exists():
+    if url == APP.qr_url and APP.run.exists("qr.png"):
         return
     if not url:
-        APP.qr_path.unlink(missing_ok=True)
+        APP.run.unlink("qr.png")
         APP.qr_url = ""
         return
     qrencode = shutil.which("qrencode")
     if not qrencode:
         return
-    tmp = APP.qr_path.with_suffix(".tmp.png")
     try:
-        subprocess.run(
-            [qrencode, "-o", str(tmp), "-s", "8", "-m", "2", "-t", "PNG", url],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        tmp.replace(APP.qr_path)
+        # qrencode writes to stdout; we do the file placement ourselves.
+        png = subprocess.run(
+            [qrencode, "-o", "-", "-s", "8", "-m", "2", "-t", "PNG", url],
+            check=True, capture_output=True, timeout=10,
+        ).stdout
+        if not png.startswith(b"\x89PNG") or len(png) > MAX_QR_FILE:
+            return
+        APP.run.write("qr.png", png)
         APP.qr_url = url
-    except (subprocess.CalledProcessError, OSError):
-        if tmp.exists():
-            tmp.unlink(missing_ok=True)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        pass
 
 
 PUBLISH_LOCK = threading.Lock()
@@ -449,8 +615,8 @@ def _publish() -> None:
             "pairExpires": int(APP.pair_expires),
             "pairedPhones": len(APP.sessions),
             "trustUrl": (pair.split("#")[0] + "ca.mobileconfig") if pair else "",
-            "qrPng": str(APP.qr_path) if APP.qr_path.exists() else "",
-            "previewJpg": str(APP.preview_path) if APP.preview_path.exists() else "",
+            "qrPng": str(APP.run.path / "qr.png") if APP.run.exists("qr.png") else "",
+            "previewJpg": str(APP.run.path / APP.preview_name) if APP.run.exists(APP.preview_name) else "",
             "iphoneUsb": phone["connected"],
             "iphoneName": phone["name"],
             "fps": round(APP.fps, 1),
@@ -462,36 +628,47 @@ def _publish() -> None:
             "error": APP.error,
             "label": NAME,
         }
-    path = APP.status_path
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(status) + "\n")
-    tmp.replace(path)
+    APP.run.write("status.json", (json.dumps(status) + "\n").encode())
+
+
+def read_status() -> dict:
+    raw = APP.run.read("status.json", MAX_STATUS_FILE)
+    return json.loads(raw) if raw else {"ok": True}
 
 
 # ---------------------------------------------------------------------------
 # Certificates
 # ---------------------------------------------------------------------------
 
-def ensure_certs() -> tuple[Path, Path]:
-    ca_key = APP.ca_dir / "ca.key"
-    ca_crt = APP.ca_dir / "ca.crt"
-    server_key = APP.ca_dir / "server.key"
-    server_crt = APP.ca_dir / "server.crt"
-    san_stamp = APP.ca_dir / "san.txt"
+def _openssl(*args: str) -> None:
+    """Run openssl inside the verified CA directory with a private umask.
 
-    if not ca_key.exists() or not ca_crt.exists():
-        subprocess.run(
-            [
-                "openssl", "req", "-new", "-x509", "-days", "3650", "-nodes",
-                "-newkey", "rsa:2048",
-                "-keyout", str(ca_key), "-out", str(ca_crt),
-                "-subj", "/CN=Omarchy iPhone Camera CA",
-            ],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+    Outputs are written under temporary names relative to that directory and
+    then placed with descriptor-relative renames by the caller.
+    """
+    subprocess.run(
+        ["openssl", *args],
+        check=True, cwd=str(APP.ca.path), umask=0o077, timeout=120,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+
+def ensure_certs() -> tuple[Path, Path]:
+    ca = APP.ca
+    for name in ("ca.srl", "server.ext", "server.csr"):   # leftovers from earlier versions
+        ca.unlink(name)
+    ca_ok = ca.verify("ca.key", MAX_PEM_FILE, secret=True) and ca.verify("ca.crt", MAX_PEM_FILE)
+    if not ca_ok:
+        # Missing, or not a regular owned 0600 file: replace it outright.
+        for name in ("ca.key", "ca.crt", "server.key", "server.crt", "san.txt"):
+            ca.unlink(name)
+        _openssl(
+            "req", "-new", "-x509", "-days", "3650", "-nodes", "-newkey", "rsa:2048",
+            "-keyout", "ca.key.new", "-out", "ca.crt.new",
+            "-subj", "/CN=Omarchy iPhone Camera CA",
         )
-        ca_key.chmod(0o600)
+        ca.rename("ca.key.new", "ca.key")
+        ca.rename("ca.crt.new", "ca.crt")
 
     ts_ip = tailscale_ip()
     ts_dns = tailscale_dns()
@@ -505,47 +682,48 @@ def ensure_certs() -> tuple[Path, Path]:
             seen.add(p)
             san.append(p)
     san_line = ",".join(san)
-    if san_stamp.exists() and san_stamp.read_text() == san_line and server_crt.exists() and server_key.exists():
+    server_key = ca.path / "server.key"
+    server_crt = ca.path / "server.crt"
+    if (
+        ca.read("san.txt", MAX_SAN_FILE) == san_line.encode()
+        and ca.verify("server.key", MAX_PEM_FILE, secret=True)
+        and ca.verify("server.crt", MAX_PEM_FILE)
+    ):
         return server_key, server_crt
 
-    ext = APP.ca_dir / "server.ext"
-    ext.write_text(
+    ca.write("server.ext", (
         "basicConstraints=CA:FALSE\n"
         "keyUsage=digitalSignature,keyEncipherment\n"
         "extendedKeyUsage=serverAuth\n"
         f"subjectAltName={san_line}\n"
-    )
-    csr = APP.ca_dir / "server.csr"
-    subprocess.run(
-        [
-            "openssl", "req", "-new", "-nodes",
-            "-newkey", "rsa:2048",
-            "-keyout", str(server_key), "-out", str(csr),
+    ).encode())
+    try:
+        _openssl(
+            "req", "-new", "-nodes", "-newkey", "rsa:2048",
+            "-keyout", "server.key.new", "-out", "server.csr",
             "-subj", "/CN=omarchy-iphone-camera",
-        ],
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    server_key.chmod(0o600)
-    subprocess.run(
-        [
-            "openssl", "x509", "-req", "-in", str(csr),
-            "-CA", str(ca_crt), "-CAkey", str(ca_key), "-CAcreateserial",
-            "-out", str(server_crt), "-days", "825", "-extfile", str(ext),
-        ],
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    csr.unlink(missing_ok=True)
-    san_stamp.write_text(san_line)
+        )
+        # A random serial avoids openssl's pathname-managed ca.srl file.
+        _openssl(
+            "x509", "-req", "-in", "server.csr", "-CA", "ca.crt", "-CAkey", "ca.key",
+            "-set_serial", "0x" + secrets.token_hex(8),
+            "-out", "server.crt.new", "-days", "825", "-extfile", "server.ext",
+        )
+        ca.rename("server.key.new", "server.key")
+        ca.rename("server.crt.new", "server.crt")
+        ca.write("san.txt", san_line.encode())
+    finally:
+        # ca.srl is what earlier versions' -CAcreateserial left behind.
+        for name in ("server.csr", "server.ext", "server.key.new", "server.crt.new", "ca.srl"):
+            ca.unlink(name)
     return server_key, server_crt
 
 
 def ca_der_b64() -> str:
-    ca_crt = APP.ca_dir / "ca.crt"
-    der = subprocess.check_output(["openssl", "x509", "-in", str(ca_crt), "-outform", "DER"])
+    pem = APP.ca.read("ca.crt", MAX_PEM_FILE) or b""
+    der = subprocess.run(
+        ["openssl", "x509", "-outform", "DER"], input=pem, check=True, capture_output=True, timeout=30,
+    ).stdout
     return base64.encodebytes(der).decode("ascii")
 
 
@@ -733,16 +911,14 @@ def write_preview(jpeg: bytes) -> None:
     # Two WebSocket threads can overlap briefly while one displaces the other.
     with PREVIEW_LOCK:
         slot = 1 - APP.preview_slot
-        path = runtime_dir() / f"preview-{slot}.jpg"
-        tmp = path.with_suffix(".tmp.jpg")
+        name = f"preview-{slot}.jpg"
         try:
-            tmp.write_bytes(jpeg)
-            tmp.replace(path)
+            APP.run.write(name, jpeg)
         except OSError:
             return
         with APP.lock:
             APP.preview_slot = slot
-            APP.preview_path = path
+            APP.preview_name = name
 
 
 def jpeg_size(data: bytes) -> tuple[int, int] | None:
@@ -917,9 +1093,14 @@ def send_ws(sock: socket.socket, opcode: int, data: bytes) -> None:
 
 def load_camera_html() -> bytes:
     path = plugin_root() / "web" / "index.html"
-    if path.exists():
-        return path.read_bytes()
-    return b"<h1>Missing web/index.html</h1>"
+    try:
+        with open(path, "rb") as f:
+            data = f.read(MAX_HTML_FILE + 1)
+    except OSError:
+        return b"<h1>Missing web/index.html</h1>"
+    if len(data) > MAX_HTML_FILE:
+        return b"<h1>web/index.html is too large</h1>"
+    return data
 
 
 PAGE_STYLE = """
@@ -1068,7 +1249,7 @@ class Handler(BaseHTTPRequestHandler):
                     [("Content-Disposition", 'attachment; filename="omarchy-iphone-camera.mobileconfig"')],
                 )
             else:
-                self._send(200, (APP.ca_dir / "ca.crt").read_bytes(), "application/x-pem-file")
+                self._send(200, APP.ca.read("ca.crt", MAX_PEM_FILE) or b"", "application/x-pem-file")
             return
         if path == "/pair":
             self._pair(parse_qs(parsed.query))
@@ -1247,10 +1428,10 @@ def handle_ctl(raw: str) -> dict:
     cmd = str(msg.get("cmd") or "")
     if cmd in ("status", ""):
         publish()
-        return json.loads(APP.status_path.read_text()) if APP.status_path.exists() else {"ok": True}
+        return read_status()
     if cmd in ("rotate-token", "new-token"):
         APP.rotate_token()
-        return json.loads(APP.status_path.read_text())
+        return read_status()
     if cmd == "stop-stream":
         _close_stream("stop-stream", notify="stop")
         publish()
@@ -1279,15 +1460,11 @@ def schedule_reexec(reason: str) -> None:
 
 
 def ctl_server() -> None:
-    path = APP.ctl_path
-    try:
-        if path.exists():
-            path.unlink()
-    except OSError:
-        pass
+    # The socket node is created 0600 by the process umask set in serve();
+    # the unlink is descriptor-relative and never follows a symlink.
+    APP.run.unlink("ctl.sock")
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.bind(str(path))
-    os.chmod(path, 0o600)
+    sock.bind(str(APP.ctl_path))
     sock.listen(8)
     sock.settimeout(1.0)
     while APP.running:
@@ -1306,19 +1483,22 @@ def ctl_server() -> None:
                 pass
     try:
         sock.close()
-        path.unlink(missing_ok=True)
+        APP.run.unlink("ctl.sock")
     except OSError:
         pass
 
 
+def ctl_socket_present() -> bool:
+    return APP.run.exists("ctl.sock", stat.S_ISSOCK)
+
+
 def ctl_client(cmd: str) -> int:
-    path = runtime_dir() / "ctl.sock"
-    if not path.exists():
+    if not ctl_socket_present():
         sys.stderr.write("iphone-camera: daemon is not running\n")
         return 1
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        sock.connect(str(path))
+        sock.connect(str(APP.ctl_path))
         sock.sendall((json.dumps({"cmd": cmd}) + "\n").encode())
         print(sock.makefile().read(), end="")
     finally:
@@ -1331,11 +1511,11 @@ def ctl_client(cmd: str) -> int:
 # ---------------------------------------------------------------------------
 
 def install_user_unit() -> Path:
-    unit_dir = Path.home() / ".config/systemd/user"
-    unit_dir.mkdir(parents=True, exist_ok=True)
-    unit = unit_dir / "omarchy-iphone-camera.service"
+    unit_dir = SafeDir.at(Path.home() / ".config/systemd", "user", private=False, create_base_mode=0o755)
+    unit = unit_dir.path / "omarchy-iphone-camera.service"
     script = Path(__file__).resolve()
-    unit.write_text(
+    unit_dir.write(
+        unit.name,
         f"""[Unit]
 Description=Omarchy iPhone Camera daemon
 After=network.target
@@ -1348,7 +1528,8 @@ RestartSec=2
 
 [Install]
 WantedBy=default.target
-"""
+""".encode(),
+        0o644,
     )
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
     return unit
@@ -1359,12 +1540,12 @@ WantedBy=default.target
 # ---------------------------------------------------------------------------
 
 def already_running() -> bool:
-    pid_path = runtime_dir() / "server.pid"
-    if not pid_path.exists():
-        return False
     try:
-        pid = int(pid_path.read_text().strip())
-    except ValueError:
+        raw = APP.run.read("server.pid", MAX_PID_FILE)
+        pid = int(raw.strip()) if raw else 0
+    except (OSError, ValueError):
+        return False
+    if pid <= 0:
         return False
     if pid == os.getpid():
         return False
@@ -1373,14 +1554,17 @@ def already_running() -> bool:
     except OSError:
         return False
     # Confirm it is us via the ctl socket
-    return (runtime_dir() / "ctl.sock").exists()
+    return ctl_socket_present()
 
 
 def serve() -> int:
     if already_running():
         log("already running")
         return 0
-    APP.pid_path.write_text(str(os.getpid()) + "\n")
+    # Everything this daemon creates is private to the user, including the
+    # control socket node, which cannot be given a mode any other way.
+    os.umask(0o077)
+    APP.run.write("server.pid", f"{os.getpid()}\n".encode())
 
     def stop(*_args: object) -> None:
         # Only flag the exit here; the main thread does the orderly teardown.
@@ -1405,8 +1589,8 @@ def serve() -> int:
         publish()
         APP.stop_event.wait(3)
     if not APP.running:
-        APP.status_path.unlink(missing_ok=True)
-        APP.pid_path.unlink(missing_ok=True)
+        APP.run.unlink("status.json")
+        APP.run.unlink("server.pid")
         return 0
     # The certificate must name the address we are about to serve on.
     try:
@@ -1465,9 +1649,8 @@ def serve() -> int:
     for srv in servers:
         srv.server_close()      # join request threads
     feed.join(timeout=2)
-    APP.status_path.unlink(missing_ok=True)
-    APP.pid_path.unlink(missing_ok=True)
-    APP.ctl_path.unlink(missing_ok=True)
+    for name in ("status.json", "server.pid", "ctl.sock"):
+        APP.run.unlink(name)
     return 0
 
 
@@ -1482,7 +1665,7 @@ def main(argv: list[str]) -> int:
     if cmd == "ctl":
         return ctl_client(argv[2] if len(argv) > 2 else "status")
     if cmd == "status":
-        if (runtime_dir() / "ctl.sock").exists():
+        if ctl_socket_present():
             return ctl_client("status")
         print(json.dumps({"ok": True, "running": False}))
         return 0
