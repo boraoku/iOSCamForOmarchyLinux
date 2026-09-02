@@ -64,6 +64,18 @@ SESSION_RE = re.compile(r"[0-9a-f]{64}")
 # the daemon waits; it never falls back to another interface.
 TAILSCALE_NET = ipaddress.IPv4Network("100.64.0.0/10")
 
+# Input limits
+# ------------
+# Every bound is checked before the corresponding bytes are read or stored.
+WS_MAX_MESSAGE = 2 * 1024 * 1024   # one reassembled binary message (a JPEG frame; 1280x720 is ~150 KB)
+WS_MAX_TEXT = 4096                 # one reassembled text message (JSON control, e.g. "hello")
+WS_MAX_CONTROL = 125               # control-frame payload, RFC 6455 §5.5
+MAX_CONNECTIONS = 16               # simultaneous client connections across both listeners
+MAX_BAD_FRAMES = 30                # consecutive rejected frames before the stream is closed
+JPEG_MIN_DIM = 16
+JPEG_MAX_DIM = 4096
+SOF_MARKERS = frozenset({0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF})
+
 PLUGIN_ID = "io.github.boraoku.ioscam"
 
 
@@ -121,6 +133,8 @@ class App:
         self.ffmpeg: subprocess.Popen[bytes] | None = None
         self.ws_conn: socket.socket | None = None
         self.conns: set[socket.socket] = set()   # every open client socket, closed at shutdown
+        self.active_conns = 0                    # accepted connections not yet finished
+        self.bad_frames = 0                      # consecutive rejected frames on the live stream
         self.latest_jpeg: bytes | None = None
         self.preview_slot = 0
         self.pair_code = ""
@@ -440,6 +454,7 @@ def _publish() -> None:
             "iphoneUsb": phone["connected"],
             "iphoneName": phone["name"],
             "fps": round(APP.fps, 1),
+            "frames": APP.frames,
             "width": APP.width,
             "height": APP.height,
             "httpPort": HTTP_PORT,
@@ -730,11 +745,57 @@ def write_preview(jpeg: bytes) -> None:
             APP.preview_path = path
 
 
-def push_frame(jpeg: bytes) -> None:
-    if len(jpeg) < 20 or jpeg[:2] != b"\xff\xd8":
-        return
+def jpeg_size(data: bytes) -> tuple[int, int] | None:
+    """(width, height) from a JPEG's frame header, or None if it is not one.
+
+    Walks the marker segments from SOI to the first SOF, checking every
+    segment length stays inside the buffer, and requires the image to end with
+    EOI. Anything else is refused before it can reach ffmpeg.
+    """
+    n = len(data)
+    if n < 4 or data[0] != 0xFF or data[1] != 0xD8 or data[-2] != 0xFF or data[-1] != 0xD9:
+        return None
+    i = 2
+    while i + 4 <= n:
+        if data[i] != 0xFF:
+            return None
+        marker = data[i + 1]
+        if marker == 0xFF:            # fill byte
+            i += 1
+            continue
+        if marker == 0x01 or 0xD0 <= marker <= 0xD8:   # standalone markers
+            i += 2
+            continue
+        if marker in (0xD9, 0xDA):    # EOI / SOS before any SOF: no frame header
+            return None
+        seglen = int.from_bytes(data[i + 2:i + 4], "big")
+        if seglen < 2 or i + 2 + seglen > n:
+            return None
+        if marker in SOF_MARKERS:
+            if seglen < 8:
+                return None
+            height = int.from_bytes(data[i + 5:i + 7], "big")
+            width = int.from_bytes(data[i + 7:i + 9], "big")
+            return width, height
+        i += 2 + seglen
+    return None
+
+
+def push_frame(jpeg: bytes) -> bool:
+    """Accept one frame from the phone. False if it was rejected."""
+    size = jpeg_size(jpeg)
+    if not size:
+        return False
+    width, height = size
+    if not (JPEG_MIN_DIM <= width <= JPEG_MAX_DIM and JPEG_MIN_DIM <= height <= JPEG_MAX_DIM):
+        return False
     now = time.monotonic()
+    restart = False
     with APP.lock:
+        if (width, height) != (APP.width, APP.height):
+            # ffmpeg was started for the old geometry; let it re-probe.
+            restart = APP.ffmpeg is not None
+            APP.width, APP.height = width, height
         APP.latest_jpeg = jpeg
         APP._fps_count += 1
         APP.frames += 1
@@ -743,7 +804,10 @@ def push_frame(jpeg: bytes) -> None:
             APP.fps = APP._fps_count / elapsed
             APP._fps_count = 0
             APP._fps_mark = now
+    if restart:
+        stop_ffmpeg()
     write_preview(jpeg)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -765,32 +829,71 @@ def recv_exact(sock: socket.socket, n: int) -> bytes:
     return bytes(buf)
 
 
+class WSProtocolError(ConnectionError):
+    """The peer violated RFC 6455; `code` is the close status to send back."""
+
+    def __init__(self, code: int, reason: str) -> None:
+        super().__init__(reason)
+        self.code = code
+
+
+def unmask(data: bytes, mask: bytes) -> bytes:
+    n = len(data)
+    if not n:
+        return data
+    # One big-int XOR instead of a Python loop per byte: ~100x faster on a
+    # 150 KB frame, which matters at 24 fps.
+    key = (mask * (n // 4 + 1))[:n]
+    return (int.from_bytes(data, "little") ^ int.from_bytes(key, "little")).to_bytes(n, "little")
+
+
 def read_ws_message(sock: socket.socket) -> tuple[int, bytes]:
+    """Read one complete message. Every limit is enforced before reading the payload.
+
+    Control frames (close/ping/pong) are returned as soon as they arrive, even
+    in the middle of a fragmented data message, as the RFC requires.
+    """
     payload = bytearray()
-    opcode = None
+    opcode: int | None = None
     while True:
         header = recv_exact(sock, 2)
-        fin = header[0] & 0x80
+        fin = bool(header[0] & 0x80)
+        rsv = header[0] & 0x70
         op = header[0] & 0x0F
-        masked = header[1] & 0x80
+        masked = bool(header[1] & 0x80)
         length = header[1] & 0x7F
+        if rsv:
+            raise WSProtocolError(1002, "reserved bits set (no extension negotiated)")
+        if not masked:
+            raise WSProtocolError(1002, "unmasked client frame")
         if length == 126:
             length = int.from_bytes(recv_exact(sock, 2), "big")
         elif length == 127:
             length = int.from_bytes(recv_exact(sock, 8), "big")
-        if length > 8_000_000:
-            raise ConnectionError("frame too large")
-        mask = recv_exact(sock, 4) if masked else b""
-        data = recv_exact(sock, length) if length else b""
-        if masked:
-            data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
-        if op in (0x8, 0x9, 0xA):
-            return op, data
-        if opcode is None:
+        control = op in (0x8, 0x9, 0xA)
+        if control:
+            if not fin or length > WS_MAX_CONTROL:
+                raise WSProtocolError(1002, "fragmented or oversized control frame")
+        elif op in (0x1, 0x2):
+            if opcode is not None:
+                raise WSProtocolError(1002, "new data frame inside a fragmented message")
             opcode = op
+        elif op == 0x0:
+            if opcode is None:
+                raise WSProtocolError(1002, "continuation frame without a message")
+        else:
+            raise WSProtocolError(1002, f"reserved opcode {op:#x}")
+        if not control:
+            limit = WS_MAX_TEXT if opcode == 0x1 else WS_MAX_MESSAGE
+            if len(payload) + length > limit:
+                raise WSProtocolError(1009, "message too large")
+        mask = recv_exact(sock, 4)
+        data = unmask(recv_exact(sock, length), mask) if length else b""
+        if control:
+            return op, data
         payload.extend(data)
         if fin:
-            return opcode or 0, bytes(payload)
+            return opcode, bytes(payload)
 
 
 def send_ws(sock: socket.socket, opcode: int, data: bytes) -> None:
@@ -1014,8 +1117,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(403, b"bad origin", "text/plain")
             return
         key = self.headers.get("Sec-WebSocket-Key", "")
-        if not key:
-            self._send(400, b"missing key", "text/plain")
+        if not key or self.headers.get("Sec-WebSocket-Version", "").strip() != "13":
+            self._send(400, b"bad websocket handshake", "text/plain")
             return
         self.close_connection = True
         accept = ws_accept(key)
@@ -1032,6 +1135,8 @@ class Handler(BaseHTTPRequestHandler):
             APP.paired = True
             APP.streaming = True
             APP.error = ""
+            APP.bad_frames = 0
+            APP.width = APP.height = 0
         if old and old is not sock:
             _close_sock(old)
         log("iPhone connected")
@@ -1044,6 +1149,10 @@ class Handler(BaseHTTPRequestHandler):
                 except socket.timeout:
                     send_ws(sock, 0x9, b"")
                     continue
+                except WSProtocolError as e:
+                    log(f"websocket protocol error: {e}")
+                    send_ws(sock, 0x8, e.code.to_bytes(2, "big") + str(e).encode()[:WS_MAX_CONTROL - 2])
+                    break
                 if op == 0x8:
                     break
                 if op == 0x9:
@@ -1056,15 +1165,21 @@ class Handler(BaseHTTPRequestHandler):
                         msg = json.loads(data.decode("utf-8"))
                     except (UnicodeDecodeError, json.JSONDecodeError):
                         continue
-                    if msg.get("type") == "hello":
+                    if isinstance(msg, dict) and msg.get("type") == "hello":
+                        camera = msg.get("camera")
                         with APP.lock:
-                            APP.camera = str(msg.get("camera") or "back")
-                            APP.width = int(msg.get("width") or 0)
-                            APP.height = int(msg.get("height") or 0)
+                            APP.camera = camera if camera in ("back", "front") else "back"
                         publish()
                     continue
                 if op == 0x2:
-                    push_frame(data)
+                    if push_frame(data):
+                        APP.bad_frames = 0
+                        continue
+                    APP.bad_frames += 1
+                    if APP.bad_frames >= MAX_BAD_FRAMES:
+                        log("closing stream: frames are not valid JPEG images")
+                        send_ws(sock, 0x8, (1003).to_bytes(2, "big") + b"not a JPEG frame")
+                        break
         except (ConnectionError, OSError, ssl.SSLError):
             pass
         finally:
@@ -1093,6 +1208,21 @@ class Server(ThreadingHTTPServer):
     daemon_threads = False
     block_on_close = True
     allow_reuse_address = True
+
+    def verify_request(self, request: socket.socket, client_address: object) -> bool:
+        # Refuse before a thread is spawned: the socket is closed unread.
+        with APP.lock:
+            if APP.active_conns >= MAX_CONNECTIONS:
+                return False
+            APP.active_conns += 1
+        return True
+
+    def process_request_thread(self, request: socket.socket, client_address: object) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            with APP.lock:
+                APP.active_conns -= 1
 
     def handle_error(self, request: object, client_address: object) -> None:
         # socketserver reports handler exceptions here (not on the handler),
