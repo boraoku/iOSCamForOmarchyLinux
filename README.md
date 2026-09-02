@@ -1,6 +1,6 @@
 # iOSCam for Omarchy
 
-![Screenshot of Plugin In Action](screenshot-2026-09-01_23-40-34.png)
+![Screenshot of Plugin In Action](preview.png)
 
 Use the **back or front camera of an iPhone** as a webcam on [Omarchy](https://omarchy.org/) Linux; the same idea as Continuity Camera on a Mac.
 
