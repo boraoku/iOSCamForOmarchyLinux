@@ -5,6 +5,9 @@ Serves a pairing page on HTTP and a Safari camera capture page on HTTPS,
 receives JPEG frames over WebSocket, and publishes them as a V4L2 webcam
 via ffmpeg + v4l2loopback.
 
+Both listeners bind to this node's Tailscale address only. The iPhone must be
+on the same tailnet; the local Wi-Fi network can never reach the ports.
+
 No third-party Python packages. Stdlib + ffmpeg, openssl, qrencode,
 idevice_id (optional).
 """
@@ -36,6 +39,30 @@ HTTP_PORT = 4747
 HTTPS_PORT = 4748
 VIDEO_NR = 42
 WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+# Pairing model
+# -------------
+# The QR code carries a one-time pairing code in the URL *fragment*. Safari keeps
+# the fragment on the phone, so the plaintext request for the landing page never
+# contains a credential. The landing page turns the fragment into an HTTPS-only
+# request to /pair, which exchanges the code for a session cookie. Only that
+# cookie (Secure, HttpOnly) authenticates the camera page and the WebSocket.
+PAIR_TTL = 10 * 60             # a QR code is valid for this long, then a fresh one is issued
+SESSION_TTL = 30 * 24 * 3600   # a paired phone stays paired for this long
+MAX_SESSIONS = 8               # paired phones remembered at once
+SESSION_COOKIE = "ioscam_session"
+PAIR_CODE_RE = re.compile(r"[0-9a-f]{32}")
+SESSION_RE = re.compile(r"[0-9a-f]{64}")
+
+# Network
+# -------
+# The daemon listens on this node's Tailscale address only. The Wi-Fi LAN
+# cannot reach the ports at all, and both the pairing hop and the video stream
+# ride inside WireGuard on top of the daemon's own TLS. The address comes from
+# the local tailscaled (via the CLI), must sit in the Tailscale range, and must
+# be present on a local interface before we bind to it. If Tailscale is down
+# the daemon waits; it never falls back to another interface.
+TAILSCALE_NET = ipaddress.IPv4Network("100.64.0.0/10")
 
 PLUGIN_ID = "io.github.boraoku.ioscam"
 
@@ -78,7 +105,7 @@ class App:
     def __init__(self) -> None:
         self.lock = threading.RLock()
         self.running = True
-        self.listening = True
+        self.stop_event = threading.Event()
         self.streaming = False
         self.paired = False
         self.camera = "back"
@@ -93,9 +120,18 @@ class App:
         self._fps_count = 0
         self.ffmpeg: subprocess.Popen[bytes] | None = None
         self.ws_conn: socket.socket | None = None
+        self.conns: set[socket.socket] = set()   # every open client socket, closed at shutdown
         self.latest_jpeg: bytes | None = None
         self.preview_slot = 0
-        self.token = self._load_or_make_token()
+        self.pair_code = ""
+        self.pair_expires = 0.0
+        self.sessions: dict[str, dict] = {}
+        self.bind_ip = ""          # tailnet address the listeners are bound to, "" until bound
+        self.tailscale_ip = ""
+        # Earlier versions kept one reusable token here; it is obsolete.
+        (state_dir() / "token").unlink(missing_ok=True)
+        self._load_sessions()
+        self._new_pair_code()
         self.preview_path = runtime_dir() / "preview-0.jpg"
         self.qr_path = runtime_dir() / "qr.png"
         self.qr_url = ""
@@ -105,32 +141,88 @@ class App:
         self.ca_dir = data_dir() / "ca"
         self.ca_dir.mkdir(mode=0o700, exist_ok=True)
 
-    def _load_or_make_token(self) -> str:
-        path = state_dir() / "token"
-        if path.exists():
-            token = path.read_text().strip()
-            if re.fullmatch(r"[0-9a-f]{32}", token):
-                return token
-        token = secrets.token_hex(16)
-        path.write_text(token + "\n")
-        path.chmod(0o600)
+    # -- one-time pairing code -------------------------------------------
+
+    def _new_pair_code(self) -> None:
+        self.pair_code = secrets.token_hex(16)
+        self.pair_expires = time.time() + PAIR_TTL
+
+    def refresh_pair_code(self) -> bool:
+        """Issue a fresh code once the current one has expired. True if it changed."""
+        with self.lock:
+            if time.time() < self.pair_expires:
+                return False
+            self._new_pair_code()
+            return True
+
+    def redeem_pair_code(self, given: str | None, agent: str = "") -> str | None:
+        """Exchange a one-time pairing code for a session token, or None if refused."""
+        if not given or not PAIR_CODE_RE.fullmatch(given):
+            return None
+        with self.lock:
+            if time.time() >= self.pair_expires or not hmac.compare_digest(given, self.pair_code):
+                return None
+            # Single use: burn the code so a photo of the QR cannot be replayed.
+            self._new_pair_code()
+            token = secrets.token_hex(32)
+            self.sessions[token] = {"created": int(time.time()), "agent": agent[:120]}
+            while len(self.sessions) > MAX_SESSIONS:
+                oldest = min(self.sessions, key=lambda t: self.sessions[t]["created"])
+                del self.sessions[oldest]
+            self._save_sessions()
         return token
 
-    def rotate_token(self) -> str:
-        with self.lock:
-            self.token = secrets.token_hex(16)
-            path = state_dir() / "token"
-            path.write_text(self.token + "\n")
-            path.chmod(0o600)
-            self.paired = False
-        self._close_stream("Pairing code rotated")
-        self.publish()
-        return self.token
+    # -- paired sessions ---------------------------------------------------
 
-    def token_ok(self, given: str | None) -> bool:
-        if not given:
+    def session_ok(self, given: str | None) -> bool:
+        if not given or not SESSION_RE.fullmatch(given):
             return False
-        return hmac.compare_digest(given, self.token)
+        now = time.time()
+        ok = False
+        with self.lock:
+            for token, meta in list(self.sessions.items()):
+                if now - meta.get("created", 0) > SESSION_TTL:
+                    del self.sessions[token]
+                    continue
+                if hmac.compare_digest(given, token):
+                    ok = True
+        return ok
+
+    def rotate_token(self) -> None:
+        """Panel action "New pairing code": forget every paired phone, issue a new code."""
+        with self.lock:
+            self.sessions.clear()
+            self._save_sessions()
+            self._new_pair_code()
+            self.paired = False
+        _close_stream("Pairing reset", notify="reset")
+        publish()
+
+    def _sessions_path(self) -> Path:
+        return state_dir() / "sessions.json"
+
+    def _load_sessions(self) -> None:
+        path = self._sessions_path()
+        try:
+            data = json.loads(path.read_text()) if path.exists() else {}
+        except (OSError, json.JSONDecodeError):
+            data = {}
+        if not isinstance(data, dict):
+            return
+        now = time.time()
+        for token, meta in data.items():
+            if not (isinstance(token, str) and SESSION_RE.fullmatch(token) and isinstance(meta, dict)):
+                continue
+            created = meta.get("created")
+            if isinstance(created, int) and now - created <= SESSION_TTL:
+                self.sessions[token] = {"created": created, "agent": str(meta.get("agent") or "")[:120]}
+
+    def _save_sessions(self) -> None:
+        path = self._sessions_path()
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(self.sessions) + "\n")
+        tmp.chmod(0o600)
+        tmp.replace(path)
 
 
 APP = App()
@@ -157,58 +249,74 @@ def find_loopback() -> str:
     return ""
 
 
-def skip_iface(name: str) -> bool:
-    n = name.lower()
-    if n.startswith("tailscale"):
-        return False
-    return n == "lo" or n.startswith(("docker", "br-", "veth", "virbr", "cni", "flannel", "wg"))
-
-
-def lan_addrs() -> list[str]:
-    addrs: list[str] = []
+def iface_addrs() -> list[tuple[str, str]]:
+    """(interface, IPv4) pairs currently configured on this host."""
+    pairs: list[tuple[str, str]] = []
     try:
         out = subprocess.check_output(["ip", "-4", "-o", "addr", "show", "scope", "global"], text=True)
     except (FileNotFoundError, subprocess.CalledProcessError):
-        return addrs
+        return pairs
     for line in out.splitlines():
         parts = line.split()
         if len(parts) < 4:
             continue
         iface, cidr = parts[1], parts[3]
-        if skip_iface(iface):
-            continue
         ip = cidr.split("/")[0]
         try:
             ipaddress.IPv4Address(ip)
         except ipaddress.AddressValueError:
             continue
-        if ip not in addrs:
-            addrs.append(ip)
-    return addrs
+        pairs.append((iface, ip))
+    return pairs
 
 
-def hostnames() -> list[str]:
-    names: list[str] = []
-    for cmd in (["hostname", "-s"], ["hostname"]):
+def tailscale_ip() -> str:
+    """This node's IPv4 on the tailnet, or "" when Tailscale is not up.
+
+    The CLI answers from the local tailscaled socket, never from the network.
+    The address must be inside 100.64.0.0/10 and actually be configured on a
+    local interface, so we never bind to (or advertise) something stale.
+    """
+    local = {ip for _, ip in iface_addrs()}
+    candidates: list[str] = []
+    cli = shutil.which("tailscale")
+    if cli:
         try:
-            n = subprocess.check_output(cmd, text=True).strip().rstrip(".")
-        except (FileNotFoundError, subprocess.CalledProcessError):
-            n = ""
-        if n and n not in names:
-            names.append(n)
-    short = names[0] if names else "omarchy"
-    for extra in (f"{short}.local",):
-        if extra not in names:
-            names.append(extra)
+            out = subprocess.check_output([cli, "ip", "-4"], text=True, stderr=subprocess.DEVNULL, timeout=5)
+            candidates += out.split()
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            pass
+    candidates += [ip for iface, ip in iface_addrs() if iface.lower().startswith("tailscale")]
+    for cand in candidates:
+        try:
+            addr = ipaddress.IPv4Address(cand)
+        except ipaddress.AddressValueError:
+            continue
+        if addr in TAILSCALE_NET and str(addr) in local:
+            return str(addr)
+    return ""
+
+
+def tailscale_dns() -> str:
     try:
-        ts = subprocess.check_output(["tailscale", "status", "--json"], text=True, stderr=subprocess.DEVNULL)
+        ts = subprocess.check_output(["tailscale", "status", "--json"], text=True, stderr=subprocess.DEVNULL, timeout=5)
         data = json.loads(ts)
-        dns = str((data.get("Self") or {}).get("DNSName") or "").rstrip(".")
-        if dns and dns not in names:
-            names.append(dns)
-    except (FileNotFoundError, subprocess.CalledProcessError, json.JSONDecodeError):
-        pass
-    return names
+        return str((data.get("Self") or {}).get("DNSName") or "").rstrip(".")
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        return ""
+
+
+def advertised() -> list[str]:
+    """Hosts the phone may use to reach us: the tailnet IP, then the MagicDNS name.
+
+    Nothing is reachable until the listeners are bound, so this is empty (and
+    the panel shows no QR) while we wait for Tailscale.
+    """
+    ip = APP.tailscale_ip if APP.bind_ip else ""
+    if not ip:
+        return []
+    dns = tailscale_dns()
+    return [ip] + ([dns] if dns else [])
 
 
 def usb_iphone() -> dict:
@@ -233,38 +341,28 @@ def usb_iphone() -> dict:
 
 
 def pair_urls() -> list[str]:
-    urls = [f"http://127.0.0.1:{HTTP_PORT}/?k={APP.token}"]
-    for ip in lan_addrs():
-        url = f"http://{ip}:{HTTP_PORT}/?k={APP.token}"
+    # The one-time code rides in the fragment, which the phone never sends to
+    # the server, so the plaintext landing-page request carries no secret.
+    code = APP.pair_code
+    urls: list[str] = []
+    for host in advertised():
+        url = f"http://{host}:{HTTP_PORT}/#{code}"
         if url not in urls:
             urls.append(url)
-    for hn in hostnames():
-        if hn.endswith(".local") or "." in hn:
-            url = f"http://{hn}:{HTTP_PORT}/?k={APP.token}"
-            if url not in urls:
-                urls.append(url)
-    return urls
-
-
-def camera_urls() -> list[str]:
-    urls = []
-    for ip in lan_addrs():
-        urls.append(f"https://{ip}:{HTTPS_PORT}/?k={APP.token}")
-    for hn in hostnames():
-        urls.append(f"https://{hn}:{HTTPS_PORT}/?k={APP.token}")
     return urls
 
 
 def public_pair_url() -> str:
     urls = pair_urls()
-    for u in urls:
-        if "127.0.0.1" not in u:
-            return u
-    return urls[0]
+    return urls[0] if urls else ""
 
 
 def write_qr(url: str) -> None:
     if url == APP.qr_url and APP.qr_path.exists():
+        return
+    if not url:
+        APP.qr_path.unlink(missing_ok=True)
+        APP.qr_url = ""
         return
     qrencode = shutil.which("qrencode")
     if not qrencode:
@@ -284,11 +382,37 @@ def write_qr(url: str) -> None:
             tmp.unlink(missing_ok=True)
 
 
+PUBLISH_LOCK = threading.Lock()
+PREVIEW_LOCK = threading.Lock()
+
+
 def publish() -> None:
+    """Write status.json (and the QR) for the panel.
+
+    Called from the main loop, the control thread, and WebSocket threads.
+    Serialized because two writers racing on the same temp file makes one
+    rename fail with FileNotFoundError; a failed publish must never take the
+    daemon down, so errors are logged and the next tick simply retries.
+    """
+    with PUBLISH_LOCK:
+        try:
+            _publish()
+        except OSError as e:
+            log(f"could not publish status: {e}")
+
+
+def _publish() -> None:
+    APP.refresh_pair_code()
     device = find_loopback()
     phone = usb_iphone()
+    ts_ip = tailscale_ip()
+    with APP.lock:
+        APP.tailscale_ip = ts_ip
+        if not APP.bind_ip:
+            APP.error = "Tailscale is not connected on this computer. Start it, then the QR code appears."
+        elif APP.error.startswith("Tailscale is not connected"):
+            APP.error = ""
     urls = pair_urls()
-    cam_urls = camera_urls()
     pair = public_pair_url()
     write_qr(pair)
     with APP.lock:
@@ -297,7 +421,9 @@ def publish() -> None:
             "ok": True,
             "schema": 1,
             "running": True,
-            "listening": APP.listening,
+            "listening": bool(APP.bind_ip),
+            "bindAddr": APP.bind_ip,
+            "tailscaleIp": ts_ip,
             "streaming": APP.streaming,
             "paired": APP.paired,
             "camera": APP.camera,
@@ -305,9 +431,10 @@ def publish() -> None:
             "deviceReady": bool(device) and os.access(device, os.W_OK),
             "needsDevice": not bool(device),
             "urls": urls,
-            "cameraUrls": cam_urls,
             "pairUrl": pair,
-            "trustUrl": pair.split("?")[0] + "ca.mobileconfig",
+            "pairExpires": int(APP.pair_expires),
+            "pairedPhones": len(APP.sessions),
+            "trustUrl": (pair.split("#")[0] + "ca.mobileconfig") if pair else "",
             "qrPng": str(APP.qr_path) if APP.qr_path.exists() else "",
             "previewJpg": str(APP.preview_path) if APP.preview_path.exists() else "",
             "iphoneUsb": phone["connected"],
@@ -351,9 +478,9 @@ def ensure_certs() -> tuple[Path, Path]:
         )
         ca_key.chmod(0o600)
 
-    ips = lan_addrs()
-    dns = hostnames()
-    san_parts = [f"IP:{ip}" for ip in ips] + [f"DNS:{n}" for n in dns]
+    ts_ip = tailscale_ip()
+    ts_dns = tailscale_dns()
+    san_parts = ([f"IP:{ts_ip}"] if ts_ip else []) + ([f"DNS:{ts_dns}"] if ts_dns else [])
     san_parts += ["IP:127.0.0.1", "DNS:localhost"]
     # Unique, stable order
     seen: set[str] = set()
@@ -540,7 +667,34 @@ def stop_ffmpeg() -> None:
             pass
 
 
-def _close_stream(reason: str = "") -> None:
+def _close_sock(sock: socket.socket | None) -> None:
+    """Tear down a socket another thread may be blocked reading.
+
+    close() alone does not wake a blocked recv() on Linux; shutdown() does, so
+    the WebSocket thread exits promptly instead of waiting out its timeout.
+    """
+    if not sock:
+        return
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+
+WS_CLOSE_STOPPED = 4000   # private close code: "the computer ended this stream on purpose"
+
+
+def _close_stream(reason: str = "", notify: str | None = None) -> None:
+    """Drop the live stream.
+
+    `notify` names why, for the phone: "stop", "reset" or "shutdown". The page
+    then stops the camera and tells the user instead of reconnecting. Pass
+    None (e.g. for an in-place restart) to let the phone reconnect on its own.
+    """
     with APP.lock:
         APP.streaming = False
         APP.fps = 0.0
@@ -548,27 +702,32 @@ def _close_stream(reason: str = "") -> None:
         sock = APP.ws_conn
         APP.ws_conn = None
     stop_ffmpeg()
-    if sock:
+    if sock and notify:
         try:
-            sock.close()
+            sock.settimeout(1.0)
+            send_ws(sock, 0x1, json.dumps({"type": "stop", "reason": notify}).encode())
+            send_ws(sock, 0x8, WS_CLOSE_STOPPED.to_bytes(2, "big") + notify.encode())
         except OSError:
             pass
+    _close_sock(sock)
     if reason:
         log(reason)
 
 
 def write_preview(jpeg: bytes) -> None:
-    slot = 1 - APP.preview_slot
-    path = runtime_dir() / f"preview-{slot}.jpg"
-    tmp = path.with_suffix(".tmp.jpg")
-    try:
-        tmp.write_bytes(jpeg)
-        tmp.replace(path)
-    except OSError:
-        return
-    with APP.lock:
-        APP.preview_slot = slot
-        APP.preview_path = path
+    # Two WebSocket threads can overlap briefly while one displaces the other.
+    with PREVIEW_LOCK:
+        slot = 1 - APP.preview_slot
+        path = runtime_dir() / f"preview-{slot}.jpg"
+        tmp = path.with_suffix(".tmp.jpg")
+        try:
+            tmp.write_bytes(jpeg)
+            tmp.replace(path)
+        except OSError:
+            return
+        with APP.lock:
+            APP.preview_slot = slot
+            APP.preview_path = path
 
 
 def push_frame(jpeg: bytes) -> None:
@@ -660,46 +819,85 @@ def load_camera_html() -> bytes:
     return b"<h1>Missing web/index.html</h1>"
 
 
-def landing_html(token: str, host: str) -> bytes:
-    camera = f"https://{host}:{HTTPS_PORT}/?k={token}"
-    profile = f"/ca.mobileconfig"
+PAGE_STYLE = """
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100dvh; font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+    background: #111; color: #f2f2f2; padding: 28px 22px 48px;
+  }
+  h1 { font-size: 1.6rem; margin: 0 0 8px; }
+  p, li { color: #bdbdbd; line-height: 1.45; }
+  ol { padding-left: 1.2em; }
+  a.btn, button {
+    display: block; width: 100%; text-align: center; text-decoration: none;
+    background: #f2f2f2; color: #111; border: 0; border-radius: 14px;
+    padding: 16px 18px; font-size: 1.05rem; font-weight: 650; margin: 14px 0;
+  }
+  a.secondary { background: #2a2a2a; color: #f2f2f2; }
+  .note { font-size: .9rem; color: #8a8a8a; }
+  .warn { color: #ffb4b4; }
+  [hidden] { display: none !important; }
+"""
+
+
+def denied_html(message: str) -> bytes:
+    safe = message.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<title>iPhone Camera</title>
+<style>{PAGE_STYLE}</style>
+</head>
+<body>
+  <h1>Not paired</h1>
+  <p class="warn">{safe}</p>
+  <p class="note">Open the camera panel in the Omarchy bar and scan the QR code with the iPhone camera.</p>
+</body>
+</html>
+""".encode("utf-8")
+
+
+def landing_html() -> bytes:
+    # Served over plaintext HTTP, so this page must not contain any secret.
+    # The pairing code lives in the URL fragment and is read on the phone only.
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="referrer" content="no-referrer">
 <title>iPhone Camera</title>
-<style>
-  :root {{ color-scheme: dark; }}
-  * {{ box-sizing: border-box; }}
-  body {{
-    margin: 0; min-height: 100dvh; font-family: -apple-system, BlinkMacSystemFont, sans-serif;
-    background: #111; color: #f2f2f2; padding: 28px 22px 48px;
-  }}
-  h1 {{ font-size: 1.6rem; margin: 0 0 8px; }}
-  p, li {{ color: #bdbdbd; line-height: 1.45; }}
-  ol {{ padding-left: 1.2em; }}
-  a.btn, button {{
-    display: block; width: 100%; text-align: center; text-decoration: none;
-    background: #f2f2f2; color: #111; border: 0; border-radius: 14px;
-    padding: 16px 18px; font-size: 1.05rem; font-weight: 650; margin: 14px 0;
-  }}
-  a.secondary {{ background: #2a2a2a; color: #f2f2f2; }}
-  .note {{ font-size: .9rem; color: #8a8a8a; }}
-</style>
+<style>{PAGE_STYLE}</style>
 </head>
 <body>
   <h1>Use this iPhone as a webcam</h1>
+  <p id="missing" class="warn" hidden>This link has no pairing code. Open the camera panel in the Omarchy bar and scan the QR code again.</p>
   <p>First time on this phone, install the trust profile so Safari can open the camera. Then start the back camera.</p>
   <ol>
     <li>Tap <b>Install trust profile</b>, then Allow / Install.</li>
     <li>Open <b>Settings → General → About → Certificate Trust Settings</b> and enable <b>Omarchy iPhone Camera</b>.</li>
     <li>Come back and tap <b>Open camera</b>. Allow camera access. Keep this page in the foreground.</li>
   </ol>
-  <a class="btn secondary" href="{profile}">Install trust profile</a>
-  <a class="btn" href="{camera}">Open camera</a>
+  <a class="btn secondary" href="/ca.mobileconfig">Install trust profile</a>
+  <a id="open" class="btn" href="#">Open camera</a>
   <p class="note">The back camera is used by default, the same way Continuity Camera does on a Mac. Pick <b>iPhone Camera</b> in Zoom, Meet, OBS, or any app.</p>
+<script>
+(() => {{
+  const code = (location.hash || "").replace(/^#/, "");
+  const open = document.getElementById("open");
+  if (/^[0-9a-f]{{32}}$/.test(code)) {{
+    open.href = "https://" + location.hostname + ":{HTTPS_PORT}/pair?p=" + code;
+  }} else {{
+    open.hidden = true;
+    document.getElementById("missing").hidden = false;
+  }}
+}})();
+</script>
 </body>
 </html>
 """.encode("utf-8")
@@ -708,24 +906,38 @@ def landing_html(token: str, host: str) -> bytes:
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     https = False
+    # Idle keep-alive connections must not pin a request thread forever, or
+    # the joined shutdown below would hang on them.
+    timeout = 30
 
     def log_message(self, fmt: str, *args: object) -> None:
         return
 
-    def handle_error(self) -> None:
-        err = sys.exception()
-        if isinstance(err, (ConnectionResetError, BrokenPipeError, ConnectionError, TimeoutError, ssl.SSLError, OSError)):
-            return
-        super().handle_error()
+    def setup(self) -> None:
+        super().setup()
+        with APP.lock:
+            APP.conns.add(self.connection)
 
-    def _host(self) -> str:
-        host = self.headers.get("Host", "").split(":")[0].strip()
-        return host or (self.client_address[0] if self.client_address else "127.0.0.1")
+    def finish(self) -> None:
+        with APP.lock:
+            APP.conns.discard(self.connection)
+        try:
+            super().finish()
+        except OSError:
+            pass
 
-    def _token(self) -> str:
-        q = parse_qs(urlparse(self.path).query)
-        vals = q.get("k") or []
-        return vals[0] if vals else ""
+    def _session_cookie(self) -> str:
+        for part in self.headers.get("Cookie", "").split(";"):
+            name, _, value = part.strip().partition("=")
+            if name.strip() == SESSION_COOKIE:
+                return value.strip()
+        return ""
+
+    def _paired(self) -> bool:
+        return self.https and APP.session_ok(self._session_cookie())
+
+    def _html(self, code: int, body: bytes, extra: list[tuple[str, str]] | None = None) -> None:
+        self._send(code, body, "text/html; charset=utf-8", extra)
 
     def _send(self, code: int, body: bytes, content_type: str, extra: list[tuple[str, str]] | None = None) -> None:
         self.send_response(code)
@@ -755,30 +967,51 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._send(200, (APP.ca_dir / "ca.crt").read_bytes(), "application/x-pem-file")
             return
-        if path == "/status":
-            self._send(200, APP.status_path.read_bytes() if APP.status_path.exists() else b"{}", "application/json")
+        if path == "/pair":
+            self._pair(parse_qs(parsed.query))
             return
         if path in ("/", "/index.html"):
-            token = self._token()
-            if not APP.token_ok(token):
-                self._send(403, b"Missing or invalid pairing code. Scan the QR code from the Omarchy bar.", "text/plain")
-                return
-            if self.https:
-                html = load_camera_html().replace(b"__TOKEN__", token.encode("ascii"))
-                self._send(200, html, "text/html; charset=utf-8")
+            if not self.https:
+                self._html(200, landing_html())
+            elif self._paired():
+                self._html(200, load_camera_html())
             else:
-                self._send(200, landing_html(token, self._host()), "text/html; charset=utf-8")
+                self._html(403, denied_html("This phone is not paired with the computer, or the pairing was reset."))
             return
         self._send(404, b"not found", "text/plain")
+
+    def _pair(self, query: dict[str, list[str]]) -> None:
+        if not self.https:
+            # Never accept, or burn, a pairing code over plaintext.
+            self._html(403, denied_html("Pairing only works over the secure link."))
+            return
+        code = (query.get("p") or [""])[0]
+        token = APP.redeem_pair_code(code, self.headers.get("User-Agent", ""))
+        if not token:
+            self._html(403, denied_html("This pairing code has expired or was already used."))
+            return
+        log("iPhone paired")
+        publish()
+        cookie = f"{SESSION_COOKIE}={token}; Path=/; Max-Age={SESSION_TTL}; Secure; HttpOnly; SameSite=Lax"
+        self._send(303, b"", "text/plain", [("Location", "/"), ("Set-Cookie", cookie)])
 
     def _websocket(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path != "/ws":
             self._send(404, b"not found", "text/plain")
             return
-        token = (parse_qs(parsed.query).get("k") or [""])[0]
-        if not APP.token_ok(token):
-            self._send(403, b"bad token", "text/plain")
+        if not self.https:
+            self._send(403, b"websocket requires https", "text/plain")
+            return
+        if not self._paired():
+            self._send(403, b"not paired", "text/plain")
+            return
+        # Same-origin only: a page from another site must not drive the camera
+        # with this phone's cookie (Safari sends Origin on every WS handshake).
+        origin = self.headers.get("Origin", "").strip().lower()
+        host = self.headers.get("Host", "").strip().lower()
+        if not host or origin != f"https://{host}":
+            self._send(403, b"bad origin", "text/plain")
             return
         key = self.headers.get("Sec-WebSocket-Key", "")
         if not key:
@@ -800,10 +1033,7 @@ class Handler(BaseHTTPRequestHandler):
             APP.streaming = True
             APP.error = ""
         if old and old is not sock:
-            try:
-                old.close()
-            except OSError:
-                pass
+            _close_sock(old)
         log("iPhone connected")
         publish()
         try:
@@ -857,8 +1087,22 @@ class HTTPHandler(Handler):
 
 
 class Server(ThreadingHTTPServer):
-    daemon_threads = True
+    # Request threads are joined by server_close(). Daemon threads that are
+    # still writing to stderr while the interpreter finalizes make CPython
+    # abort ("could not acquire lock for <stderr> at interpreter shutdown").
+    daemon_threads = False
+    block_on_close = True
     allow_reuse_address = True
+
+    def handle_error(self, request: object, client_address: object) -> None:
+        # socketserver reports handler exceptions here (not on the handler),
+        # printing a traceback to stderr by default. Dropped connections are
+        # routine; log anything else in one line.
+        err = sys.exception()
+        if isinstance(err, (ConnectionError, TimeoutError, ssl.SSLError, OSError)):
+            return
+        peer = client_address[0] if isinstance(client_address, tuple) and client_address else "?"
+        log(f"request from {peer} failed: {err!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -878,7 +1122,7 @@ def handle_ctl(raw: str) -> dict:
         APP.rotate_token()
         return json.loads(APP.status_path.read_text())
     if cmd == "stop-stream":
-        _close_stream("stop-stream")
+        _close_stream("stop-stream", notify="stop")
         publish()
         return {"ok": True}
     if cmd == "shutdown":
@@ -886,6 +1130,22 @@ def handle_ctl(raw: str) -> dict:
         threading.Thread(target=lambda: (time.sleep(0.2), os.kill(os.getpid(), signal.SIGTERM)), daemon=True).start()
         return {"ok": True}
     return {"ok": False, "error": f"unknown cmd {cmd}"}
+
+
+def schedule_reexec(reason: str) -> None:
+    """Restart in place (same PID, same systemd unit) so the listeners rebind.
+
+    Runs on a short delay so the control reply gets out first. Sockets are
+    non-inheritable, so the old listeners die with the exec.
+    """
+    def go() -> None:
+        time.sleep(0.3)
+        _close_stream(f"restarting: {reason}")
+        sys.stderr.flush()
+        script = sys.argv[0] if sys.argv and os.path.isfile(sys.argv[0]) else str(Path(__file__).resolve())
+        os.execv(sys.executable, [sys.executable, script, *sys.argv[1:]])
+
+    threading.Thread(target=go, name="reexec", daemon=True).start()
 
 
 def ctl_server() -> None:
@@ -991,48 +1251,90 @@ def serve() -> int:
         log("already running")
         return 0
     APP.pid_path.write_text(str(os.getpid()) + "\n")
+
+    def stop(*_args: object) -> None:
+        # Only flag the exit here; the main thread does the orderly teardown.
+        APP.running = False
+        APP.stop_event.set()
+
+    servers: list[Server] = []
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+
+    # The control socket comes up first so the panel can talk to us (status,
+    # reset, shutdown) even while we are waiting for Tailscale below.
+    threading.Thread(target=ctl_server, name="ctl", daemon=True).start()
+
+    # Fail closed: never bind to another interface. Wait until the tailnet
+    # address exists on this host, publishing the reason meanwhile.
+    bind = ""
+    while APP.running:
+        bind = tailscale_ip()
+        if bind:
+            break
+        publish()
+        APP.stop_event.wait(3)
+    if not APP.running:
+        APP.status_path.unlink(missing_ok=True)
+        APP.pid_path.unlink(missing_ok=True)
+        return 0
+    # The certificate must name the address we are about to serve on.
     try:
         server_key, server_crt = ensure_certs()
     except subprocess.CalledProcessError as e:
         log(f"could not create TLS certificates: {e}")
         return 1
 
-    httpd = Server(("0.0.0.0", HTTP_PORT), HTTPHandler)
-    httpsd = Server(("0.0.0.0", HTTPS_PORT), HTTPSHandler)
+    try:
+        httpd = Server((bind, HTTP_PORT), HTTPHandler)
+        httpsd = Server((bind, HTTPS_PORT), HTTPSHandler)
+    except OSError as e:
+        log(f"could not listen on {bind}: {e}")
+        return 1
+    servers[:] = [httpd, httpsd]
+    with APP.lock:
+        APP.bind_ip = bind
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     ctx.load_cert_chain(str(server_crt), str(server_key))
     httpsd.socket = ctx.wrap_socket(httpsd.socket, server_side=True)
 
-    def stop(*_args: object) -> None:
-        APP.running = False
-        _close_stream("shutdown")
-        threading.Thread(target=httpd.shutdown, daemon=True).start()
-        threading.Thread(target=httpsd.shutdown, daemon=True).start()
-
-    signal.signal(signal.SIGTERM, stop)
-    signal.signal(signal.SIGINT, stop)
-
-    threading.Thread(target=ctl_server, name="ctl", daemon=True).start()
-    threading.Thread(target=feed_loop, name="feed", daemon=True).start()
-    threading.Thread(target=httpd.serve_forever, name="http", daemon=True).start()
-    threading.Thread(target=httpsd.serve_forever, name="https", daemon=True).start()
+    feed = threading.Thread(target=feed_loop, name="feed", daemon=True)
+    feed.start()
+    for srv, name in ((httpd, "http"), (httpsd, "https")):
+        threading.Thread(target=srv.serve_forever, name=name, daemon=True).start()
 
     publish()
-    log(f"listening on http://0.0.0.0:{HTTP_PORT} and https://0.0.0.0:{HTTPS_PORT}")
-    log(f"pair at {public_pair_url()}")
+    log(f"listening on http://{bind}:{HTTP_PORT} and https://{bind}:{HTTPS_PORT} (tailnet only)")
+    log(f"pair at {public_pair_url().split('#')[0]} (code shown in the bar panel)")
 
     while APP.running:
-        time.sleep(2.5)
-        # Refresh certs if LAN IPs changed (new Wi-Fi / USB tether).
+        if APP.stop_event.wait(2.5):
+            break
         try:
-            ensure_certs()
-        except subprocess.CalledProcessError:
-            pass
-        publish()
+            publish()
+            # Tailscale went away or moved: the bound address is dead. Restart
+            # so we go back to waiting for the tailnet rather than serving
+            # nothing. The restart also re-issues the certificate.
+            if APP.tailscale_ip != bind:
+                schedule_reexec("tailscale address changed")
+                APP.stop_event.wait(5)
+        except Exception as e:  # noqa: BLE001 - the main loop must not die
+            log(f"main loop error: {e!r}")
 
-    httpd.server_close()
-    httpsd.server_close()
+    # Orderly teardown, all from this thread: drop the stream (which wakes the
+    # WebSocket thread), stop accepting, then join every request thread so
+    # none is still running when the interpreter finalizes.
+    _close_stream("shutdown", notify="shutdown")
+    for srv in servers:
+        srv.shutdown()          # stop accepting
+    with APP.lock:
+        conns = list(APP.conns)
+    for conn in conns:          # wake every request thread still blocked on a client
+        _close_sock(conn)
+    for srv in servers:
+        srv.server_close()      # join request threads
+    feed.join(timeout=2)
     APP.status_path.unlink(missing_ok=True)
     APP.pid_path.unlink(missing_ok=True)
     APP.ctl_path.unlink(missing_ok=True)

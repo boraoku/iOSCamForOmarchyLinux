@@ -5,6 +5,8 @@ function emptyStatus() {
     ok: false,
     running: false,
     listening: false,
+    bindAddr: "",
+    tailscaleIp: "",
     streaming: false,
     paired: false,
     camera: "back",
@@ -12,8 +14,9 @@ function emptyStatus() {
     deviceReady: false,
     needsDevice: true,
     urls: [],
-    cameraUrls: [],
     pairUrl: "",
+    pairExpires: 0,
+    pairedPhones: 0,
     trustUrl: "",
     qrPng: "",
     previewJpg: "",
@@ -37,6 +40,8 @@ function parseStatus(raw) {
   out.ok = data.ok === true
   out.running = data.running === true
   out.listening = data.listening === true
+  out.bindAddr = String(data.bindAddr || "")
+  out.tailscaleIp = String(data.tailscaleIp || "")
   out.streaming = data.streaming === true
   out.paired = data.paired === true
   out.camera = String(data.camera || "back")
@@ -44,8 +49,9 @@ function parseStatus(raw) {
   out.deviceReady = data.deviceReady === true
   out.needsDevice = data.needsDevice !== false && !out.deviceReady
   out.urls = Array.isArray(data.urls) ? data.urls.map(String) : []
-  out.cameraUrls = Array.isArray(data.cameraUrls) ? data.cameraUrls.map(String) : []
   out.pairUrl = String(data.pairUrl || "")
+  out.pairExpires = Number(data.pairExpires || 0)
+  out.pairedPhones = Number(data.pairedPhones || 0)
   out.trustUrl = String(data.trustUrl || "")
   out.qrPng = String(data.qrPng || "")
   out.previewJpg = String(data.previewJpg || "")

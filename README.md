@@ -6,11 +6,15 @@ Use the **back or front camera of an iPhone** as a webcam on [Omarchy](https://o
 
 The phone is the lens. Linux apps see a normal camera named **iPhone Camera**. No App Store app: scan a QR code, trust a profile once, and Safari streams the back camera.
 
+**Tailscale is required.** The computer and the iPhone must both be on the same [Tailscale](https://tailscale.com) tailnet. The daemon listens on its Tailscale address only, so the local Wi-Fi network never sees the camera ports, and everything travels inside WireGuard on top of the daemon's own TLS.
+
 This is **not** Apple’s Continuity Camera protocol (that needs an Apple ID, AWDL, and a Mac). It is the closest thing that works on Linux.
 
 ![Omarchy](https://img.shields.io/badge/Omarchy-4-black) ![License](https://img.shields.io/badge/license-MIT-blue)
 
 ## Install
+
+Before anything else, have Tailscale running on the computer (`tailscale up`) and install the [Tailscale app](https://apps.apple.com/app/tailscale/id1470499037) on the iPhone, logged in to the same tailnet.
 
 ```sh
 omarchy plugin add https://github.com/boraoku/iOSCamForOmarchyLinux.git --enable
@@ -32,8 +36,8 @@ omarchy bar move io.github.boraoku.ioscam --section right
 
 ## Use it
 
-1. Click the camera icon in the Omarchy bar and turn it on.
-2. Scan the QR code with the iPhone (same Wi-Fi, or USB Personal Hotspot).
+1. Click the camera icon in the Omarchy bar and turn it on. The QR code appears once Tailscale is connected on the computer.
+2. Turn on Tailscale on the iPhone, then scan the QR code with the Camera app.
 3. **First time only**
    - Tap **Install trust profile**
    - On the iPhone: **Settings → General → About → Certificate Trust Settings** → enable **Omarchy iPhone Camera**
@@ -50,22 +54,33 @@ omarchy bar move io.github.boraoku.ioscam --section right
 | Right click | Start / stop the daemon |
 | Middle click | Refresh |
 | `c` | Copy the pairing link |
-| `n` | New pairing code |
+| `n` | New pairing code (forgets every paired phone) |
 | `s` | Set up the virtual camera |
 | Esc | Close |
 
 ## How it works
 
-- A small Python daemon (stdlib only) serves an HTTP pairing page (`:4747`) and an HTTPS capture page (`:4748`).
+- A small Python daemon (stdlib only) serves an HTTP pairing page (`:4747`) and an HTTPS capture page (`:4748`), bound to the computer's Tailscale address only.
 - Safari captures the **back** camera and sends 1280×720 JPEG frames over a WebSocket.
 - The daemon repeats the latest frame at a steady 24 fps into `ffmpeg`, which writes a constant-size YUV stream to a `v4l2loopback` device.
-- Pairing URLs carry a secret token. **New code** in the panel invalidates the old QR.
+- The QR code carries a **one-time pairing code** in the URL fragment, which the phone never sends over the network. The landing page redeems it over HTTPS for a session cookie; only that cookie lets a phone open the camera page and stream. Codes expire after 10 minutes or on first use.
+- **New code** in the panel forgets every paired phone and issues a fresh QR.
+- Status and control never leave the machine: the panel reads a status file and a Unix socket in `$XDG_RUNTIME_DIR`, both `0700`. Nothing on the network reports the daemon's state.
+- The plaintext HTTP port serves only the static landing page and the public CA certificate; it accepts no credentials and no WebSocket.
 
-Wired mode: plug the iPhone in, enable **Personal Hotspot → USB**, then scan again. Wi-Fi, USB-tether, and Tailscale addresses are all advertised.
+### Why Tailscale only
+
+- The daemon asks the local `tailscale` CLI for this node's IPv4 (a Unix-socket query to `tailscaled`, never a network lookup). The address must lie in `100.64.0.0/10` and must be present on a local interface, or it is ignored.
+- Both listeners bind to that address alone. Nothing is reachable from the Wi-Fi network, not even the pairing page.
+- If Tailscale is not connected, the daemon waits and the panel says so. It never falls back to another interface. If the Tailscale address changes, the daemon restarts itself and re-issues its certificate for the new address.
+- Only the Tailscale IP and the MagicDNS name are advertised, and the QR code uses the IP.
+
+Wired use: plug the iPhone in and enable **Personal Hotspot → USB**. Tailscale routes over the cable on its own; the QR code does not change.
 
 ## Requirements
 
 - Omarchy 4 (Quickshell bar)
+- **Tailscale** on the computer and on the iPhone, both on the same tailnet
 - iPhone with Safari (iOS 15+)
 - `ffmpeg`, `openssl`, `qrencode`, `v4l2loopback-dkms`, `v4l2loopback-utils`
 - Optional: `libimobiledevice` (ships with Omarchy) so the panel can notice a USB-connected iPhone

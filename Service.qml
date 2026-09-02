@@ -81,6 +81,7 @@ Item {
 
   function rotateToken() { sendCtl("rotate-token") }
   function stopStream() { sendCtl("stop-stream") }
+  readonly property bool tailnetBound: status.bindAddr !== ""
 
   function setupDevice() {
     setupBusy = true

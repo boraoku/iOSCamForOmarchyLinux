@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="referrer" content="no-referrer">
 <title>iPhone Camera</title>
 <style>
   :root { color-scheme: dark; }
@@ -50,12 +51,14 @@
   </div>
 <script>
 (() => {
-  const TOKEN = "__TOKEN__";
   const OUT_W = 1280;
   const OUT_H = 720;
   const FPS = 24;
-  const proto = location.protocol === "https:" ? "wss" : "ws";
-  const wsUrl = `${proto}://${location.host}/ws?k=${encodeURIComponent(TOKEN)}`;
+  // The pairing cookie (Secure, HttpOnly) authenticates this socket; nothing
+  // secret lives in the page or the URL.
+  const wsUrl = `wss://${location.host}/ws`;
+  const MAX_FAILED_CONNECTS = 5;
+  const STOPPED_BY_COMPUTER = 4000;   // close code the daemon uses when it ends the stream on purpose
 
   const video = document.getElementById("video");
   const canvas = document.getElementById("canvas");
@@ -75,6 +78,7 @@
   let wakeLock = null;
   let timer = 0;
   let encoding = false;
+  let failedConnects = 0;
 
   canvas.width = OUT_W;
   canvas.height = OUT_H;
@@ -105,16 +109,35 @@
     const socket = new WebSocket(wsUrl);
     socket.binaryType = "arraybuffer";
     ws = socket;
+    let opened = false;
     socket.onopen = () => {
+      opened = true;
+      failedConnects = 0;
       setErr("");
       setStatus(cameraName() + " camera · live");
       sendHello();
     };
-    socket.onclose = () => {
-      if (ws === socket) ws = null;
-      if (running) setTimeout(connect, 800);
+    socket.onmessage = (ev) => {
+      if (typeof ev.data !== "string") return;
+      let msg = null;
+      try { msg = JSON.parse(ev.data); } catch (_) { return; }
+      if (msg && msg.type === "stop") stoppedByComputer(msg.reason);
     };
-    socket.onerror = () => setErr("Could not reach the computer. Stay on the same Wi-Fi, or use USB hotspot.");
+    socket.onclose = (ev) => {
+      if (ws === socket) ws = null;
+      if (!running) return;
+      if (ev && ev.code === STOPPED_BY_COMPUTER) { stoppedByComputer(ev.reason); return; }
+      if (!opened) failedConnects += 1;
+      if (failedConnects >= MAX_FAILED_CONNECTS) {
+        // Nothing answers, or the handshake keeps being refused: stop trying
+        // rather than hammering the socket forever.
+        stop();
+        setErr("Lost the computer. Check the camera is on in the Omarchy bar and Tailscale is connected, then tap Start. If it still fails, scan the QR code again.");
+        return;
+      }
+      setTimeout(connect, 800);
+    };
+    socket.onerror = () => setErr("Could not reach the computer. Make sure Tailscale is connected on this iPhone.");
   }
 
   function sendHello() {
@@ -230,6 +253,15 @@
     running = true;
     startBtn.textContent = "Stop";
     pump();
+  }
+
+  // The daemon ended the stream deliberately (Stop, New code, or turned off).
+  // Stop the camera and say why, instead of reconnecting.
+  function stoppedByComputer(reason) {
+    stop();
+    if (reason === "reset") setErr("Pairing was reset on the computer. Scan the QR code again.");
+    else if (reason === "shutdown") setErr("The camera was turned off on the computer. Turn it on, then tap Start.");
+    else setErr("Stopped from the computer. Tap Start to stream again.");
   }
 
   function stop() {

@@ -134,7 +134,13 @@ Panel {
     function onStatusChanged() {
       var url = cam.status.pairUrl
       var png = cam.status.qrPng
-      if (!url || !png) return
+      if (!url) {
+        // Tailscale-only mode while Tailscale is down: nothing to scan.
+        root.qrSource = ""
+        root.lastPairUrl = ""
+        return
+      }
+      if (!png) return
       if (url === root.lastPairUrl && root.qrSource !== "") return
       root.lastPairUrl = url
       root.qrSource = "file://" + png + "?v=" + Date.now()
@@ -301,7 +307,7 @@ Panel {
             width: parent.width
             textFormat: Text.PlainText
             wrapMode: Text.WordWrap
-            text: "Scan with the iPhone camera. First time only: install the trust profile, then Settings → General → About → Certificate Trust Settings → enable Omarchy iPhone Camera. Keep Safari open on the back camera."
+            text: "Turn on Tailscale on the iPhone, then scan with the camera. First time only: install the trust profile, then Settings → General → About → Certificate Trust Settings → enable Omarchy iPhone Camera. Keep Safari open on the back camera."
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
@@ -323,7 +329,7 @@ Panel {
             width: parent.width
             textFormat: Text.PlainText
             wrapMode: Text.WordWrap
-            text: (cam.status.iphoneName || "iPhone") + " is on USB. For a wired link, enable Personal Hotspot → USB, then rescan the code."
+            text: (cam.status.iphoneName || "iPhone") + " is on USB. With Personal Hotspot → USB on, Tailscale routes over the cable; the QR code stays the same."
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
@@ -359,6 +365,18 @@ Panel {
               onHovered: function (on) { if (on) root.focusRow("stop") }
               onClicked: cam.stopStream()
             }
+          }
+
+          Text {
+            width: parent.width
+            textFormat: Text.PlainText
+            wrapMode: Text.WordWrap
+            text: cam.tailnetBound
+              ? "Tailscale only. Listening on " + cam.status.bindAddr + ". The iPhone needs the Tailscale app connected to the same tailnet."
+              : "Waiting for Tailscale on this computer. Nothing is listening until it connects."
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
           }
         }
 
